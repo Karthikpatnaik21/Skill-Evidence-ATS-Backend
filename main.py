@@ -730,3 +730,313 @@ def audit_social_links(payload: SocialAuditInput):
         discrepancies=discrepancies_list,
         justification=justification
     )
+
+# --- Sandbox API Endpoints ---
+import sys
+import gzip
+import json
+import zipfile
+import xml.etree.ElementTree as ET
+
+def get_challenge_file_path(filename: str) -> str:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Look for [PUB] India_runs_data_and_ai_challenge in base_dir
+    challenge_dir = os.path.join(base_dir, "[PUB] India_runs_data_and_ai_challenge", "[PUB] India_runs_data_and_ai_challenge", "India_runs_data_and_ai_challenge")
+    if os.path.exists(challenge_dir):
+        return os.path.join(challenge_dir, filename)
+    # Check direct relative path
+    challenge_dir_direct = os.path.join(base_dir, "India_runs_data_and_ai_challenge")
+    if os.path.exists(challenge_dir_direct):
+        return os.path.join(challenge_dir_direct, filename)
+    return filename
+
+def extract_docx_text_raw(docx_path: str) -> str:
+    if not os.path.exists(docx_path):
+        return ""
+    try:
+        with zipfile.ZipFile(docx_path) as docx:
+            xml_content = docx.read('word/document.xml')
+            root = ET.fromstring(xml_content)
+            paragraphs = []
+            for paragraph in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
+                texts = []
+                for text in paragraph.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
+                    if text.text:
+                        texts.append(text.text)
+                if texts:
+                    paragraphs.append(''.join(texts))
+            return '\n'.join(paragraphs)
+    except Exception as e:
+        logger.error(f"Error extracting text from docx {docx_path}: {e}")
+        return ""
+
+def calculate_candidate_potential(candidate: dict) -> float:
+    signals = candidate.get('redrob_signals', {})
+    gh_score = signals.get('github_activity_score', -1)
+    proj_complexity = gh_score if gh_score > 0 else 50.0
+    
+    profile = candidate.get('profile', {})
+    yoe = profile.get('years_of_experience', 0.0)
+    
+    assessments = signals.get('skill_assessment_scores', {})
+    if assessments:
+        avg_assessment = sum(assessments.values()) / len(assessments)
+    else:
+        avg_assessment = 50.0
+        
+    if yoe < 2.0:
+        learning_velocity = 85.0
+    elif yoe < 5.0:
+        learning_velocity = 75.0
+    else:
+        learning_velocity = 65.0
+        
+    skills = candidate.get('skills', [])
+    if skills:
+        prof_map = {'beginner': 30, 'intermediate': 60, 'advanced': 85, 'expert': 100}
+        avg_prof = sum(prof_map.get(s.get('proficiency', '').lower(), 50) for s in skills) / len(skills)
+    else:
+        avg_prof = 50.0
+        
+    potential = (proj_complexity * 0.3) + (avg_assessment * 0.3) + (learning_velocity * 0.2) + (avg_prof * 0.2)
+    return round(min(max(potential, 0.0), 100.0), 1)
+
+class DisqualifiedCandidateLog(BaseModel):
+    candidate_id: str
+    name: str
+    score: float
+    stage: str
+    reason: str
+
+class RankedCandidateDetail(BaseModel):
+    candidate_id: str
+    rank: int
+    score: float
+    potential: float
+    reasoning: str
+    name: str
+    stage: str
+    details: dict
+
+class BatchRankResponse(BaseModel):
+    ranked_candidates: List[RankedCandidateDetail]
+    disqualified_candidates: List[DisqualifiedCandidateLog]
+    total_processed: int
+    duration_ms: float
+    candidates_per_sec: float
+
+class BatchRankInput(BaseModel):
+    candidates: Optional[List[dict]] = None
+    file_path: Optional[str] = None
+    deep_search: bool = False
+    jd_profile: Optional[dict] = None
+
+@app.get("/api/v1/sandbox/job-description", response_model=JobDescriptionProfile)
+def get_challenge_job_description():
+    jd_path = get_challenge_file_path("job_description.docx")
+    jd_text = extract_docx_text_raw(jd_path)
+    
+    fallback_profile = JobDescriptionProfile(
+        title="Senior AI Engineer — Founding Team",
+        requiredSkills=[
+            "embeddings-based retrieval systems (sentence-transformers, BGE, E5)",
+            "vector databases / hybrid search (Pinecone, Weaviate, Qdrant, Milvus, OpenSearch)",
+            "Strong Python (clean code, standard guidelines)",
+            "evaluation frameworks for ranking (NDCG, MRR, MAP, offline/online)"
+        ],
+        preferredSkills=[
+            "LLM fine-tuning experience (LoRA, QLoRA, PEFT)",
+            "learning-to-rank models (XGBoost-based or neural)",
+            "distributed systems / large-scale inference optimization",
+            "open-source contributions in the AI/ML space",
+            "prior exposure to HR-tech / marketplace products"
+        ],
+        responsibilities=[
+            "Own the intelligence, ranking, and matching layer of the Redrob product.",
+            "Audit the current search engine (BM25 + rule-based scoring).",
+            "Ship a v2 ranking system that improves recruiter-engagement metrics.",
+            "Set up the evaluation infrastructure (offline benchmarks, online A/B testing)."
+        ],
+        seniority="Senior AI Engineer (5–9 years experience target)",
+        idealProfile="6–8 years total experience with 4–5 years in applied ML/AI roles at product companies. Has shipped end-to-end ranking/search systems to production and has strong opinions on hybrid vs dense retrieval."
+    )
+    
+    if not jd_text:
+        return fallback_profile
+        
+    if is_gemini_connected:
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            prompt = f"""
+            Analyze the extracted Job Description text:
+            ---
+            {jd_text}
+            ---
+            Extract the structured details matching the JobDescriptionProfile schema.
+            """
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    response_schema=JobDescriptionProfile
+                )
+            )
+            return JobDescriptionProfile.model_validate_json(response.text)
+        except Exception as e:
+            logger.error(f"Gemini job description extraction failed, returning fallback: {e}")
+            return fallback_profile
+    else:
+        return fallback_profile
+
+@app.post("/api/v1/sandbox/rank-batch", response_model=BatchRankResponse)
+def rank_batch_sandbox(payload: BatchRankInput):
+    import time
+    start_time = time.time()
+    
+    # Import the functions from rank.py in root
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        import rank
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to import ranker module: {str(e)}")
+        
+    candidates_scored = []
+    disqualified_logs = []
+    total_processed = 0
+    
+    # Select candidate pool
+    candidates_to_process = []
+    if payload.candidates is not None:
+        candidates_to_process = payload.candidates
+    elif payload.file_path:
+        # Resolve file path
+        resolved_path = payload.file_path
+        if not os.path.isabs(resolved_path):
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if os.path.exists(os.path.join(base_dir, resolved_path)):
+                resolved_path = os.path.join(base_dir, resolved_path)
+            else:
+                resolved_path = get_challenge_file_path(payload.file_path)
+                
+        if not os.path.exists(resolved_path):
+            raise HTTPException(status_code=404, detail=f"Candidate file not found at: {resolved_path}")
+            
+        is_gzip = resolved_path.endswith('.gz')
+        open_func = gzip.open if is_gzip else open
+        mode = 'rt' if is_gzip else 'r'
+        
+        try:
+            with open_func(resolved_path, mode, encoding='utf-8') as f:
+                # Detect if the file is a JSON array or JSON Lines
+                chunk = f.read(100)
+                is_json_array = chunk.strip().startswith('[')
+                
+            with open_func(resolved_path, mode, encoding='utf-8') as f:
+                if is_json_array:
+                    candidates_to_process = json.load(f)
+                else:
+                    # Generator-based parser for memory savings
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        try:
+                            candidate = json.loads(line_str)
+                            total_processed += 1
+                            cid = candidate.get('candidate_id', 'UNKNOWN')
+                            
+                            score, is_disq, reason, stage = rank.evaluate_candidate(candidate, deep_search=payload.deep_search, jd_profile=payload.jd_profile)
+                            
+                            if is_disq:
+                                disqualified_logs.append(DisqualifiedCandidateLog(
+                                    candidate_id=cid,
+                                    name=candidate.get('profile', {}).get('anonymized_name', 'Unknown'),
+                                    score=score,
+                                    stage=stage,
+                                    reason=reason
+                                ))
+                            else:
+                                candidates_scored.append({
+                                    "candidate_id": cid,
+                                    "score": score,
+                                    "potential": calculate_candidate_potential(candidate),
+                                    "candidate": candidate,
+                                    "stage": stage
+                                })
+                        except Exception:
+                            continue
+                    
+                    # Already processed through the file generator
+                    # Skip the default list loop
+                    candidates_to_process = []
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error reading candidate pool file: {str(e)}")
+    else:
+        raise HTTPException(status_code=400, detail="Either candidates list or file_path must be provided.")
+        
+    # Process if we have a parsed list (from payload.candidates or JSON array file)
+    for candidate in candidates_to_process:
+        total_processed += 1
+        cid = candidate.get('candidate_id', 'UNKNOWN')
+        
+        score, is_disq, reason, stage = rank.evaluate_candidate(candidate, deep_search=payload.deep_search, jd_profile=payload.jd_profile)
+        
+        if is_disq:
+            disqualified_logs.append(DisqualifiedCandidateLog(
+                candidate_id=cid,
+                name=candidate.get('profile', {}).get('anonymized_name', 'Unknown'),
+                score=score,
+                stage=stage,
+                reason=reason
+            ))
+        else:
+            candidates_scored.append({
+                "candidate_id": cid,
+                "score": score,
+                "potential": calculate_candidate_potential(candidate),
+                "candidate": candidate,
+                "stage": stage
+            })
+            
+    # Sort: score desc → potential desc (tie-breaker #1) → candidate_id asc (deterministic tie-breaker #2)
+    candidates_scored.sort(
+        key=lambda x: (-x['score'], -x['potential'], x['candidate_id'])
+    )
+    
+    # Take top 100
+    top_100 = candidates_scored[:100]
+    
+    ranked_candidates = []
+    for r, item in enumerate(top_100, 1):
+        cid = item['candidate_id']
+        score = item['score']
+        potential = item['potential']
+        stage = item['stage']
+        candidate = item['candidate']
+        
+        reasoning = rank.generate_reasoning(candidate, r, score, stage)
+        ranked_candidates.append(RankedCandidateDetail(
+            candidate_id=cid,
+            rank=r,
+            score=score,
+            potential=potential,
+            reasoning=reasoning,
+            name=candidate.get('profile', {}).get('anonymized_name', 'Unknown'),
+            stage=stage,
+            details=candidate
+        ))
+        
+    end_time = time.time()
+    duration_sec = end_time - start_time
+    duration_ms = duration_sec * 1000.0
+    candidates_per_sec = total_processed / duration_sec if duration_sec > 0 else 0.0
+    
+    return BatchRankResponse(
+        ranked_candidates=ranked_candidates,
+        disqualified_candidates=disqualified_logs,
+        total_processed=total_processed,
+        duration_ms=round(duration_ms, 2),
+        candidates_per_sec=round(candidates_per_sec, 2)
+    )
+
+
