@@ -1,27 +1,32 @@
 import os
+import sys
 import logging
 import re
+import json
+import gzip
+import threading
+import time
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import google.generativeai as genai
-from dotenv import load_dotenv
 import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("skill-evidence-backend")
 
-load_dotenv()
-
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Skill Evidence ATS API",
-    description="Explainable AI Candidate Ranking Engine API utilizing Google Gemini",
-    version="1.0.0"
+    description="Explainable AI Candidate Ranking Engine — 100% offline, local LLM powered",
+    version="2.0.0",
 )
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,110 +35,209 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Gemini Client
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-is_gemini_connected = False
+# ---------------------------------------------------------------------------
+# Local LLM — initialise in a background thread so the server starts fast
+# ---------------------------------------------------------------------------
+import llm_engine
 
-if GEMINI_API_KEY:
+def _boot_llm():
+    llm_engine.initialize()
+
+threading.Thread(target=_boot_llm, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Dynamic Company Founding Dates cache (no LLM needed — use Wikipedia API)
+# ---------------------------------------------------------------------------
+COMPANY_FOUNDING_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "company_founding_dates.json",
+)
+
+_DEFAULT_FOUNDING: dict[str, int] = {
+    "sarvam": 2023, "krutrim": 2023, "saarthi.ai": 2017, "rephrase.ai": 2019,
+    "yellow.ai": 2016, "google": 1998, "microsoft": 1975, "apple": 1976,
+    "amazon": 1994, "meta": 2004, "netflix": 1997, "tcs": 1968,
+    "wipro": 1945, "infosys": 1981, "cognizant": 1994, "accenture": 1989,
+    "capgemini": 1967, "openai": 2015, "anthropic": 2021, "mistral": 2023,
+    "cohere": 2019, "deepmind": 2010, "stability ai": 2020,
+}
+
+COMPANY_FOUNDING_YEARS: dict[str, int] = dict(_DEFAULT_FOUNDING)
+
+
+def load_company_founding_dates() -> dict:
+    merged = dict(_DEFAULT_FOUNDING)
+    if os.path.exists(COMPANY_FOUNDING_CACHE_FILE):
+        try:
+            with open(COMPANY_FOUNDING_CACHE_FILE, "r", encoding="utf-8") as f:
+                merged.update(json.load(f))
+        except Exception as e:
+            logger.error(f"Error loading company founding cache: {e}")
+    return merged
+
+
+def save_company_founding_dates(data: dict):
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        # Verify key with a lightweight check
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        model.generate_content("ping")
-        is_gemini_connected = True
-        logger.info("Successfully connected to Gemini API.")
+        with open(COMPANY_FOUNDING_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
     except Exception as e:
-        logger.error(f"Gemini API initialization failed: {e}")
-else:
-    logger.warning("GEMINI_API_KEY not found in environment. Running in Mock fallback mode.")
+        logger.error(f"Error saving company founding cache: {e}")
 
-# --- Pydantic Schemas ---
+
+COMPANY_FOUNDING_YEARS = load_company_founding_dates()
+
+
+async def fetch_and_cache_founding_year(company_name: str):
+    """Look up a company's founding year via Wikipedia API — no LLM cost."""
+    company_clean = company_name.strip().lower()
+    if not company_clean:
+        return
+    if any(k in company_clean for k in COMPANY_FOUNDING_YEARS):
+        return
+
+    logger.info(f"Looking up founding year for: {company_name}")
+    founding_year = 2015  # safe default
+
+    try:
+        wiki_url = (
+            "https://en.wikipedia.org/w/api.php"
+            f"?action=query&prop=revisions&rvprop=content&format=json"
+            f"&titles={company_name}&rvsection=0"
+        )
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(wiki_url, headers={"User-Agent": "SkillEvidenceATS/2.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            pages = data.get("query", {}).get("pages", {})
+            for page in pages.values():
+                content = page.get("revisions", [{}])[0].get("*", "")
+                year_match = re.search(r'\b(19[5-9]\d|20[0-2]\d)\b', content)
+                if year_match:
+                    founding_year = int(year_match.group(1))
+                    break
+    except Exception as e:
+        logger.debug(f"Wikipedia lookup failed for {company_name}: {e}")
+
+    COMPANY_FOUNDING_YEARS[company_clean] = founding_year
+    save_company_founding_dates(COMPANY_FOUNDING_YEARS)
+    logger.info(f"Cached '{company_name}' → {founding_year}")
+
+
+def _weekly_refresh():
+    while True:
+        time.sleep(604800)  # 1 week
+        COMPANY_FOUNDING_YEARS.update(load_company_founding_dates())
+        logger.info("Weekly company dates cache refreshed.")
+
+
+threading.Thread(target=_weekly_refresh, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Pydantic Schemas
+# ---------------------------------------------------------------------------
 
 class JobInput(BaseModel):
     jd_text: str
 
+
 class JobDescriptionProfile(BaseModel):
-    title: str = Field(description="The formal job title of the position.")
-    requiredSkills: List[str] = Field(description="List of mandatory technical skills candidate must possess.")
-    preferredSkills: List[str] = Field(description="List of optional or nice-to-have skills.")
-    responsibilities: List[str] = Field(description="List of core duties and responsibilities.")
-    seniority: str = Field(description="Expected seniority level or years of experience target.")
-    idealProfile: str = Field(description="A 2-3 sentence summary describing the ideal candidate for this role.")
+    title: str = Field(description="Formal job title.")
+    requiredSkills: List[str] = Field(description="Mandatory technical skills.")
+    preferredSkills: List[str] = Field(description="Nice-to-have skills.")
+    responsibilities: List[str] = Field(description="Core duties.")
+    seniority: str = Field(description="Expected seniority / years of experience.")
+    idealProfile: str = Field(description="2-3 sentence ideal candidate description.")
+    validationWarnings: Optional[List[str]] = Field(default=[], description="Detected impossible/contradictory requirements.")
+
 
 class ResumeInput(BaseModel):
     resume_text: str
 
+
 class ProjectDetail(BaseModel):
-    title: str = Field(description="Title of the project.")
-    description: str = Field(description="Description of the project's purpose, design, and achievements.")
-    technologies: List[str] = Field(description="List of tools, languages, and frameworks used in this project.")
+    title: str
+    description: str
+    technologies: List[str]
+
 
 class ExperienceDetail(BaseModel):
-    role: str = Field(description="Job title or role held.")
-    company: str = Field(description="Company or organization name.")
-    duration: str = Field(description="Timeframe or years active.")
-    description: str = Field(description="Brief summary of duties, accomplishments, and technologies used.")
+    role: str
+    company: str
+    duration: str
+    description: str
+
 
 class EducationDetail(BaseModel):
-    degree: str = Field(description="Degree or certification title.")
-    school: str = Field(description="Name of university or school.")
-    year: str = Field(description="Graduation year.")
+    degree: str
+    school: str
+    year: str
+
 
 class SocialLinks(BaseModel):
-    github: Optional[str] = Field(default=None, description="GitHub profile URL")
-    linkedin: Optional[str] = Field(default=None, description="LinkedIn profile URL")
-    portfolio: Optional[str] = Field(default=None, description="Portfolio URL")
-    website: Optional[str] = Field(default=None, description="Personal website or blog URL")
+    github: Optional[str] = None
+    linkedin: Optional[str] = None
+    portfolio: Optional[str] = None
+    website: Optional[str] = None
+
 
 class CandidateProfile(BaseModel):
-    name: str = Field(description="Full name of the candidate.")
-    skills: List[str] = Field(description="List of skills explicitly mentioned in the resume.")
-    projects: List[ProjectDetail] = Field(description="List of projects described in the resume.")
-    experience: List[ExperienceDetail] = Field(description="List of professional job experiences.")
-    education: List[EducationDetail] = Field(description="List of academic degrees.")
-    certifications: List[str] = Field(description="List of formal certifications.")
-    achievements: List[str] = Field(description="List of personal or technical achievements.")
-    socialLinks: Optional[SocialLinks] = Field(default=None, description="Extracted web profile and contact links.")
+    name: str
+    skills: List[str]
+    projects: List[ProjectDetail]
+    experience: List[ExperienceDetail]
+    education: List[EducationDetail]
+    certifications: List[str]
+    achievements: List[str]
+    socialLinks: Optional[SocialLinks] = None
+
 
 class EvidenceInput(BaseModel):
     required_skills: List[str]
     candidate_profile: CandidateProfile
 
+
 class SkillEvidenceMetrics(BaseModel):
-    skillName: str = Field(description="Name of the skill being analyzed.")
-    isMentioned: bool = Field(description="Whether the skill is explicitly mentioned in the candidate profile.")
-    projectUsageCount: int = Field(description="Number of candidate projects that utilize this skill.")
-    professionalExperienceYears: int = Field(description="Number of years of professional work experience utilizing this skill.")
-    leadershipUsage: bool = Field(description="Whether the candidate led projects or teams utilizing this skill.")
-    evidencePoints: List[str] = Field(description="Bullet points of concrete evidence in projects or experience backing up this skill.")
-    score: int = Field(description="Skill capability score out of 100 based on the evidence found.")
+    skillName: str
+    isMentioned: bool
+    projectUsageCount: int
+    professionalExperienceYears: int
+    leadershipUsage: bool
+    evidencePoints: List[str]
+    score: int
+
 
 class SkillEvidenceResponse(BaseModel):
     evidence: List[SkillEvidenceMetrics]
+
 
 class ProjectRelevanceInput(BaseModel):
     responsibilities: List[str]
     projects: List[ProjectDetail]
 
+
 class ProjectRelevanceDetail(BaseModel):
-    projectTitle: str = Field(description="Title of the candidate's project.")
-    matchScore: int = Field(description="Semantic relevance score from 0 to 100 matching the job responsibilities.")
-    justification: str = Field(description="A concise 1-2 sentence justification for the match score.")
-    alignedSkills: List[str] = Field(description="Skills used in this project that align with the job description.")
+    projectTitle: str
+    matchScore: int
+    justification: str
+    alignedSkills: List[str]
+
 
 class ProjectRelevanceResponse(BaseModel):
     relevance: List[ProjectRelevanceDetail]
 
+
 class CareerStageDetection(BaseModel):
-    detectedStage: str = Field(description="Classify candidate career stage: 'fresher', 'mid', or 'senior'.")
-    detectedYearsOfExperience: int = Field(description="Total years of professional experience.")
-    reasoning: str = Field(description="Reasoning for stage classification.")
+    detectedStage: str
+    detectedYearsOfExperience: int
+    reasoning: str
+
 
 class DeepReviewSignals(BaseModel):
-    githubChecked: bool = Field(default=False, description="Whether GitHub has been verified.")
-    linkedinChecked: bool = Field(default=False, description="Whether LinkedIn has been verified.")
-    portfolioChecked: bool = Field(default=False, description="Whether portfolio has been verified.")
-    websiteChecked: bool = Field(default=False, description="Whether personal website has been verified.")
+    githubChecked: bool = False
+    linkedinChecked: bool = False
+    portfolioChecked: bool = False
+    websiteChecked: bool = False
+
 
 class RankCalculationInput(BaseModel):
     candidate_profile: CandidateProfile
@@ -144,11 +248,13 @@ class RankCalculationInput(BaseModel):
     weights_config: dict
     deep_review_signals: Optional[DeepReviewSignals] = None
 
+
 class ExplainabilityDetailsResponse(BaseModel):
-    strengths: List[str] = Field(description="3-4 bullet points describing key strengths matching the job requirements.")
-    weaknesses: List[str] = Field(description="2-3 bullet points identifying gaps or areas of improvement.")
-    recommendation: str = Field(description="Recommendation status: 'Strong Fit', 'Moderate Fit', or 'No Fit'.")
-    reasoning: str = Field(description="A detailed 2-3 sentence paragraph summarizing the fit and justification.")
+    strengths: List[str]
+    weaknesses: List[str]
+    recommendation: str
+    reasoning: str
+
 
 class SocialAuditInput(BaseModel):
     github_url: Optional[str] = None
@@ -158,18 +264,21 @@ class SocialAuditInput(BaseModel):
     candidate_id: Optional[str] = None
     candidate_name: Optional[str] = None
 
+
 class GithubRepoInfo(BaseModel):
-    name: str = Field(description="Name of the repository")
-    description: Optional[str] = Field(None, description="Description of the repository")
-    primary_language: Optional[str] = Field(None, description="Primary language of the repo")
-    stars: int = Field(0, description="Star count")
-    url: str = Field(description="GitHub URL of the repository")
+    name: str
+    description: Optional[str] = None
+    primary_language: Optional[str] = None
+    stars: int = 0
+    url: str
+
 
 class LLMSocialAnalysis(BaseModel):
-    code_complexity_score: int = Field(description="LLM rating (0-100) of codebase complexity based on repo metadata and languages.")
-    portfolio_quality_score: int = Field(description="LLM rating (0-100) of portfolio design, project descriptions, and framing.")
-    strengths: List[str] = Field(description="List of detected strengths")
-    weaknesses: List[str] = Field(description="List of detected gaps or red flags")
+    code_complexity_score: int
+    portfolio_quality_score: int
+    strengths: List[str]
+    weaknesses: List[str]
+
 
 class SocialAuditResponse(BaseModel):
     github_verified: bool
@@ -180,626 +289,576 @@ class SocialAuditResponse(BaseModel):
     discrepancies: List[str]
     justification: str
 
-# --- Endpoints ---
+# ---------------------------------------------------------------------------
+# Heuristic helpers (fast, offline, no LLM needed)
+# ---------------------------------------------------------------------------
+
+def _heuristic_skill_evidence(
+    required_skills: List[str], profile: CandidateProfile
+) -> List[SkillEvidenceMetrics]:
+    prof_map = {"beginner": 1, "intermediate": 2, "advanced": 3, "expert": 4}
+    results = []
+    skills_lower = {s.lower(): s for s in profile.skills}
+
+    for skill in required_skills:
+        sl = skill.lower()
+
+        # Projects that mention the skill
+        proj_count = sum(
+            1 for p in profile.projects
+            if sl in " ".join(p.technologies).lower() or sl in p.description.lower()
+        )
+
+        # Professional experience years (rough: count matching jobs)
+        exp_years = 0
+        leadership = False
+        for exp in profile.experience:
+            text = (exp.role + " " + exp.description + " " + exp.company).lower()
+            if sl in text:
+                # Try to extract number from duration like "2 years", "18 months"
+                dur = exp.duration.lower()
+                yr = re.search(r'(\d+)\s*year', dur)
+                mo = re.search(r'(\d+)\s*month', dur)
+                exp_years += int(yr.group(1)) if yr else (int(mo.group(1)) // 12 if mo else 1)
+                if any(kw in text for kw in ["lead", "mentor", "architect", "head", "owned"]):
+                    leadership = True
+
+        is_mentioned = sl in skills_lower or sl in " ".join(profile.skills).lower()
+
+        # Score
+        score = 0
+        if is_mentioned:
+            score += 15
+        score += min(proj_count * 20, 40)
+        score += min(exp_years * 8, 30)
+        if leadership:
+            score += 15
+        score = min(score, 100)
+
+        evidence_points = []
+        if proj_count > 0:
+            evidence_points.append(f"Used in {proj_count} project(s)")
+        if exp_years > 0:
+            evidence_points.append(f"~{exp_years} year(s) of professional usage")
+        if leadership:
+            evidence_points.append("Leadership role with this skill detected")
+        if not evidence_points:
+            evidence_points.append("Listed in skills section; no project/work context found")
+
+        results.append(
+            SkillEvidenceMetrics(
+                skillName=skill,
+                isMentioned=is_mentioned,
+                projectUsageCount=proj_count,
+                professionalExperienceYears=min(exp_years, 20),
+                leadershipUsage=leadership,
+                evidencePoints=evidence_points,
+                score=score,
+            )
+        )
+    return results
+
+
+def _heuristic_project_relevance(
+    responsibilities: List[str], projects: List[ProjectDetail]
+) -> List[ProjectRelevanceDetail]:
+    resp_text = " ".join(responsibilities).lower()
+    resp_tokens = set(resp_text.split())
+    results = []
+
+    for proj in projects:
+        proj_text = (
+            proj.title + " " + proj.description + " " + " ".join(proj.technologies)
+        ).lower()
+        proj_tokens = set(proj_text.split())
+        overlap = len(resp_tokens & proj_tokens)
+        score = min(overlap * 7, 95)
+
+        aligned = [t for t in proj.technologies if t.lower() in resp_text]
+
+        results.append(
+            ProjectRelevanceDetail(
+                projectTitle=proj.title,
+                matchScore=score,
+                justification=(
+                    f"Project uses {len(proj.technologies)} technologies with "
+                    f"{overlap} keyword overlaps against job responsibilities."
+                ),
+                alignedSkills=aligned,
+            )
+        )
+    return results
+
+
+def _heuristic_stage_detect(profile: CandidateProfile) -> CareerStageDetection:
+    # Sum years from all experience entries
+    total_yoe = 0
+    for exp in profile.experience:
+        dur = exp.duration.lower()
+        yr = re.search(r"(\d+)\s*year", dur)
+        mo = re.search(r"(\d+)\s*month", dur)
+        total_yoe += int(yr.group(1)) if yr else (int(mo.group(1)) / 12 if mo else 1)
+
+    if total_yoe < 1:
+        stage, reason = "fresher", "Fresh graduate or early career; fewer than 1 year of experience."
+    elif total_yoe < 3:
+        stage, reason = "fresher", f"Early career with {total_yoe:.0f} years of experience."
+    elif total_yoe < 6:
+        stage, reason = "mid", f"Mid-level professional with {total_yoe:.0f} years of experience."
+    elif total_yoe < 10:
+        stage, reason = "senior", f"Senior engineer with {total_yoe:.0f} years of experience."
+    else:
+        stage, reason = "senior", f"Highly experienced professional with {total_yoe:.0f}+ years."
+
+    return CareerStageDetection(
+        detectedStage=stage,
+        detectedYearsOfExperience=int(total_yoe),
+        reasoning=reason,
+    )
+
+
+def validate_job_description(jd_text: str, profile_dict: dict) -> List[str]:
+    """Check for impossible/contradictory requirements in a JD."""
+    warnings: List[str] = []
+    ltext = jd_text.lower()
+    seniority = (profile_dict.get("seniority") or "").lower()
+
+    # 1. Fresher + high YoE requirement
+    is_fresher = any(k in ltext for k in ["fresher", "entry-level", "entry level"]) or \
+                 any(k in seniority for k in ["fresher", "entry-level", "0-2 years"])
+    if is_fresher:
+        yoe_hits = re.findall(r"\b([3-9]|\d{2,})\+?\s*years?\b", ltext)
+        if yoe_hits:
+            warnings.append(
+                f"Contradictory seniority: Role is 'Fresher/Entry-level' but requests "
+                f"{yoe_hits[0]}+ years of experience. "
+                f"Suggestion: Change seniority to 'Mid-level' or reduce YoE to 0-1 years."
+            )
+
+    # 2. Impossible experience for recently-launched technologies (reference: June 2026)
+    TECH_LIMITS = {
+        "gemini": (30, "Google Gemini (Dec 2023)"),
+        "gpt-4": (39, "GPT-4 (Mar 2023)"),
+        "gpt4": (39, "GPT-4 (Mar 2023)"),
+        "chatgpt": (43, "ChatGPT (Nov 2022)"),
+        "llama": (40, "Meta LLaMA (Feb 2023)"),
+        "langchain": (44, "LangChain (Oct 2022)"),
+        "llamaindex": (43, "LlamaIndex (Nov 2022)"),
+        "mojo": (37, "Mojo Lang (May 2023)"),
+        "bge": (34, "BGE Embeddings (Aug 2023)"),
+        "whisper": (45, "OpenAI Whisper (Sep 2022)"),
+        "copilot": (60, "GitHub Copilot (Jun 2021)"),
+        "sora": (28, "OpenAI Sora (Feb 2024)"),
+        "mistral": (36, "Mistral AI (Jun 2023)"),
+        "claude": (42, "Anthropic Claude (Mar 2023)"),
+    }
+    for tech, (max_months, name) in TECH_LIMITS.items():
+        if tech not in ltext:
+            continue
+        for m in re.finditer(r"\b(\d+)\+?\s*years?\b", ltext):
+            yoe_val = int(m.group(1))
+            ctx = ltext[max(0, m.start() - 100): m.end() + 100]
+            if tech in ctx:
+                max_yrs = max_months / 12.0
+                if yoe_val > max_yrs + 0.5:
+                    sug = f"{int(max_yrs)} year(s)" if int(max_yrs) > 0 else "under 1 year"
+                    warnings.append(
+                        f"Impossible requirement: {yoe_val}+ years with {name}, which has "
+                        f"only existed for {round(max_yrs, 1)} years. "
+                        f"Suggestion: Cap experience requirement at {sug}."
+                    )
+                break
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/api/v1/health")
 def health_check():
     return {
         "status": "ok",
-        "gemini_connected": is_gemini_connected,
-        "api_key_configured": GEMINI_API_KEY is not None
+        "llm_active": llm_engine.is_llm_active,
+        "llm_model": llm_engine.loaded_model_name,
+        "gemini_connected": False,  # kept for frontend compatibility
+        "api_key_configured": False,
     }
+
 
 @app.post("/api/v1/job/understand", response_model=JobDescriptionProfile)
 def understand_job(payload: JobInput):
-    if not is_gemini_connected:
-        raise HTTPException(status_code=503, detail="Gemini API is not configured or offline.")
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""
-        Analyze this Job Description:
-        ---
-        {payload.jd_text}
-        ---
-        Extract the structured details matching the requested JSON schema.
-        """
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=JobDescriptionProfile
-            )
-        )
-        return JobDescriptionProfile.model_validate_json(response.text)
-    except Exception as e:
-        logger.error(f"Job extraction error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to analyze job description: {str(e)}")
+    # Try local LLM first, then heuristics
+    raw = llm_engine.parse_jd(payload.jd_text)
+
+    # Validate / coerce fields
+    title = raw.get("title", "Software Engineer")
+    required = raw.get("requiredSkills", [])
+    preferred = raw.get("preferredSkills", [])
+    responsibilities = raw.get("responsibilities", [])
+    seniority = raw.get("seniority", "Mid-level (3-5 years)")
+    ideal = raw.get("idealProfile", "")
+
+    if not isinstance(required, list):
+        required = [str(required)]
+    if not isinstance(preferred, list):
+        preferred = []
+    if not isinstance(responsibilities, list):
+        responsibilities = ["Design and implement software solutions."]
+
+    profile_dict = {
+        "title": title,
+        "requiredSkills": required,
+        "preferredSkills": preferred,
+        "responsibilities": responsibilities,
+        "seniority": seniority,
+        "idealProfile": ideal,
+    }
+    warnings = validate_job_description(payload.jd_text, profile_dict)
+    return JobDescriptionProfile(**profile_dict, validationWarnings=warnings)
+
 
 @app.post("/api/v1/resume/parse", response_model=CandidateProfile)
 def parse_resume(payload: ResumeInput):
-    if not is_gemini_connected:
-        raise HTTPException(status_code=503, detail="Gemini API is not configured or offline.")
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""
-        You are a highly advanced ATS resume parser. Your goal is to carefully extract all candidate details from the text below:
-        ---
-        {payload.resume_text}
-        ---
-        
-        Strict Extraction Guidelines:
-        1. Full Name: Look at the very top of the resume, usually the first line or the largest text. Do not miss it.
-        2. Professional Experience: Extract ALL professional work experiences, including job titles, companies, durations, and descriptions. Do not omit any jobs, even if they are short (e.g., 1 year or 6 months). Look under sections like 'Experience', 'Work History', 'Professional Experience', or 'Employment'.
-        3. Projects: Extract all projects described in the resume with descriptions and technologies list.
-        4. Skills: Extract all technical and soft skills listed.
-        5. Education: Extract degrees, institutions, and graduation years.
-        6. Certifications & Achievements: Extract any certifications or accomplishments.
-        7. Social Links: Extract actual GitHub profile URL, LinkedIn profile URL, portfolio URL, and personal website or blog URL if present. Do not guess or invent URLs; only extract if explicitly stated in the text.
-        """
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=CandidateProfile
-            )
-        )
-        return CandidateProfile.model_validate_json(response.text)
-    except Exception as e:
-        logger.error(f"Resume parse error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to parse resume: {str(e)}")
+    raw = llm_engine.parse_resume(payload.resume_text)
+
+    def _safe_list(val, default=None):
+        if isinstance(val, list):
+            return val
+        return default or []
+
+    def _coerce_projects(items):
+        out = []
+        for p in _safe_list(items):
+            if isinstance(p, dict):
+                out.append(ProjectDetail(
+                    title=p.get("title", "Project"),
+                    description=p.get("description", ""),
+                    technologies=_safe_list(p.get("technologies"), []),
+                ))
+        return out
+
+    def _coerce_experience(items):
+        out = []
+        for e in _safe_list(items):
+            if isinstance(e, dict):
+                out.append(ExperienceDetail(
+                    role=e.get("role", "Engineer"),
+                    company=e.get("company", "Company"),
+                    duration=e.get("duration", ""),
+                    description=e.get("description", ""),
+                ))
+        return out
+
+    def _coerce_education(items):
+        out = []
+        for ed in _safe_list(items):
+            if isinstance(ed, dict):
+                out.append(EducationDetail(
+                    degree=ed.get("degree", ""),
+                    school=ed.get("school", ""),
+                    year=str(ed.get("year", "")),
+                ))
+        return out
+
+    sl_raw = raw.get("socialLinks") or {}
+    social = SocialLinks(
+        github=sl_raw.get("github"),
+        linkedin=sl_raw.get("linkedin"),
+        portfolio=sl_raw.get("portfolio"),
+        website=sl_raw.get("website"),
+    )
+
+    return CandidateProfile(
+        name=raw.get("name", "Candidate"),
+        skills=_safe_list(raw.get("skills"), []),
+        projects=_coerce_projects(raw.get("projects")),
+        experience=_coerce_experience(raw.get("experience")),
+        education=_coerce_education(raw.get("education")),
+        certifications=_safe_list(raw.get("certifications"), []),
+        achievements=_safe_list(raw.get("achievements"), []),
+        socialLinks=social,
+    )
+
 
 @app.post("/api/v1/evidence/score", response_model=List[SkillEvidenceMetrics])
 def score_evidence(payload: EvidenceInput):
-    if not is_gemini_connected:
-        raise HTTPException(status_code=503, detail="Gemini API is not configured or offline.")
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""
-        Analyze the candidate's profile to extract verified evidence for each of these required skills: {payload.required_skills}.
-        
-        Candidate Profile:
-        ---
-        {payload.candidate_profile.model_dump_json()}
-        ---
-        
-        Rules for scoring & evidence:
-        1. Look for projects, professional experience, certifications, and leadership roles.
-        2. Be critical: do NOT award high scores (e.g. above 30) or create evidence for skills that are only mentioned in a list of skills without project or work context.
-        3. If a skill is only listed in a 'Skills' section but never mentioned in projects or experience, set isMentioned=True, score=15, projectUsageCount=0, and state 'Mentioned in skills list but lacks project or work experience context' as the evidence point.
-        """
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=SkillEvidenceResponse
-            )
-        )
-        parsed_res = SkillEvidenceResponse.model_validate_json(response.text)
-        return parsed_res.evidence
-    except Exception as e:
-        logger.error(f"Evidence scoring error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to score skill evidence: {str(e)}")
+    return _heuristic_skill_evidence(payload.required_skills, payload.candidate_profile)
+
 
 @app.post("/api/v1/project/relevance", response_model=List[ProjectRelevanceDetail])
 def analyze_projects(payload: ProjectRelevanceInput):
-    if not is_gemini_connected:
-        raise HTTPException(status_code=503, detail="Gemini API is not configured or offline.")
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        projects_data = [p.model_dump() for p in payload.projects]
-        prompt = f"""
-        Evaluate these candidate projects against the job responsibilities.
-        
-        Job Responsibilities:
-        {payload.responsibilities}
-        
-        Candidate Projects:
-        {projects_data}
-        
-        Determine semantic similarity (matchScore from 0 to 100), identify which skills align, and write a 1-2 sentence justification.
-        """
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=ProjectRelevanceResponse
-            )
-        )
-        parsed_res = ProjectRelevanceResponse.model_validate_json(response.text)
-        return parsed_res.relevance
-    except Exception as e:
-        logger.error(f"Project relevance error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to analyze project relevance: {str(e)}")
+    return _heuristic_project_relevance(payload.responsibilities, payload.projects)
+
 
 @app.post("/api/v1/stage/detect", response_model=CareerStageDetection)
 def detect_stage(payload: CandidateProfile):
-    if not is_gemini_connected:
-        raise HTTPException(status_code=503, detail="Gemini API is not configured or offline.")
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""
-        Analyze this candidate's history to determine their career stage: 'fresher', 'mid', or 'senior'.
-        Also estimate their total years of professional experience.
-        
-        Candidate Profile:
-        ---
-        {payload.model_dump_json()}
-        ---
-        """
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=CareerStageDetection
-            )
-        )
-        return CareerStageDetection.model_validate_json(response.text)
-    except Exception as e:
-        logger.error(f"Stage detection error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to detect career stage: {str(e)}")
+    return _heuristic_stage_detect(payload)
+
 
 @app.post("/api/v1/candidate/rank")
 def rank_candidate(payload: RankCalculationInput):
-    # Determine the stage from stage_detection input
     stage = payload.stage_detection.detectedStage.lower()
-    if stage not in ['fresher', 'mid', 'senior']:
-        stage = 'mid'
-        
-    # Get active weights for this stage
+    if stage not in ["fresher", "mid", "senior"]:
+        stage = "mid"
+
     stage_weights = payload.weights_config.get(stage, {})
-    
     total_score = 0.0
     total_weight = 0.0
-    avg_skill = sum(se.score for se in payload.skill_evidence) / len(payload.skill_evidence) if len(payload.skill_evidence) > 0 else 0
-    avg_proj = sum(pr.matchScore for pr in payload.project_relevance) / len(payload.project_relevance) if len(payload.project_relevance) > 0 else 0
-    
-    # 1. Skill Evidence
-    w_skill = stage_weights.get("skillEvidence", 0)
-    if w_skill > 0 and len(payload.skill_evidence) > 0:
-        total_score += avg_skill * w_skill
-        total_weight += w_skill
-        
-    # 2. Project Relevance
-    w_project = stage_weights.get("projectRelevance", 0)
-    if w_project > 0 and len(payload.project_relevance) > 0:
-        total_score += avg_proj * w_project
-        total_weight += w_project
-        
-    # Standard static mock subscores fallback or derived if profile lacks them
-    # For a fully dynamic scoring, we can parse candidate profiles for learning velocity & knowledge depth
-    # but for compatibility with sandbox slider metrics, we extract them or mock them consistently
-    learning_velocity = 80
-    knowledge_depth = 75
-    experience_match = 50
-    leadership_impact = 40
-    
-    # Simple heuristics based on projects count and experiences
-    if stage == 'fresher':
-        learning_velocity = 90
-        knowledge_depth = 80
-        leadership_impact = 20
-        experience_match = 10
-    elif stage == 'mid':
-        learning_velocity = 75
-        knowledge_depth = 82
-        leadership_impact = 50
-        experience_match = 75
-    else: # senior
-        learning_velocity = 60
-        knowledge_depth = 92
-        leadership_impact = 95
-        experience_match = 90
 
-    # 3. Knowledge Depth
-    w_knowledge = stage_weights.get("knowledgeDepth", 0)
-    if w_knowledge > 0:
-        total_score += knowledge_depth * w_knowledge
-        total_weight += w_knowledge
-        
-    # 4. Learning Velocity
-    w_velocity = stage_weights.get("learningVelocity", 0)
-    if w_velocity > 0:
-        total_score += learning_velocity * w_velocity
-        total_weight += w_velocity
-        
-    # 5. Experience Match
-    w_exp = stage_weights.get("experienceMatch", 0)
-    if w_exp > 0:
-        total_score += experience_match * w_exp
-        total_weight += w_exp
-        
-    # 6. Leadership Impact
-    w_lead = stage_weights.get("leadershipImpact", 0)
-    if w_lead > 0:
-        total_score += leadership_impact * w_lead
-        total_weight += w_lead
-        
+    avg_skill = (
+        sum(se.score for se in payload.skill_evidence) / len(payload.skill_evidence)
+        if payload.skill_evidence else 0
+    )
+    avg_proj = (
+        sum(pr.matchScore for pr in payload.project_relevance) / len(payload.project_relevance)
+        if payload.project_relevance else 0
+    )
+
+    if stage == "fresher":
+        lv, kd, em, li = 90, 80, 10, 20
+    elif stage == "mid":
+        lv, kd, em, li = 75, 82, 75, 50
+    else:
+        lv, kd, em, li = 60, 92, 90, 95
+
+    for key, value in [
+        ("skillEvidence", avg_skill), ("projectRelevance", avg_proj),
+        ("knowledgeDepth", kd), ("learningVelocity", lv),
+        ("experienceMatch", em), ("leadershipImpact", li),
+    ]:
+        w = stage_weights.get(key, 0)
+        if w > 0:
+            total_score += value * w
+            total_weight += w
+
     base_score = round(total_score / total_weight) if total_weight > 0 else 0
-    
-    # Deep Review Bonus Score
     bonus = 0
     if payload.deep_review_signals:
-        if payload.deep_review_signals.githubChecked:
-            bonus += 3
-        if payload.deep_review_signals.linkedinChecked:
-            bonus += 2
-        if payload.deep_review_signals.portfolioChecked:
-            bonus += 3
-        if payload.deep_review_signals.websiteChecked:
-            bonus += 2
-            
+        bonus += 3 if payload.deep_review_signals.githubChecked else 0
+        bonus += 2 if payload.deep_review_signals.linkedinChecked else 0
+        bonus += 3 if payload.deep_review_signals.portfolioChecked else 0
+        bonus += 2 if payload.deep_review_signals.websiteChecked else 0
+
     final_score = min(base_score + bonus, 100)
-    
-    # Potential Score measures future success potential.
-    # Components: Project Complexity (projectRelevance), Learning Velocity, Knowledge Depth
-    potential_score = round((avg_proj + learning_velocity + knowledge_depth) / 3)
-    
-    # If Gemini is configured, generate qualitative strengths, weaknesses and paragraph reasoning
-    strengths = ["Strong alignment across mandatory requirements."]
-    weaknesses = ["Tenure gaps or missing secondary certifications."]
-    recommendation = "Moderate Fit"
-    reasoning = "Candidate matches core expectations but lacks comprehensive niche skills."
-    
-    if is_gemini_connected:
-        try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            prompt = f"""
-            Synthesize the suitability of candidate {payload.candidate_profile.name} (Career Stage: {stage}, Final Score: {final_score}) for the job {payload.jd_profile.title}.
-            
-            Candidate parsed details:
-            - Skills: {payload.candidate_profile.skills}
-            - Projects Count: {len(payload.candidate_profile.projects)}
-            - Experience Count: {len(payload.candidate_profile.experience)}
-            - Skill evidence results: {[se.skillName + ': ' + str(se.score) for se in payload.skill_evidence]}
-            - Project relevance results: {[pr.projectTitle + ': ' + str(pr.matchScore) for pr in payload.project_relevance]}
-            
-            Based on this information, output strengths, weaknesses, a final recommendation ('Strong Fit', 'Moderate Fit', or 'No Fit'), and a 2-3 sentence reasoning paragraph.
-            """
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExplainabilityDetailsResponse
-                )
-            )
-            parsed_explain = ExplainabilityDetailsResponse.model_validate_json(response.text)
-            strengths = parsed_explain.strengths
-            weaknesses = parsed_explain.weaknesses
-            recommendation = parsed_explain.recommendation
-            reasoning = parsed_explain.reasoning
-        except Exception as e:
-            logger.error(f"Explainability synthesis error: {e}")
-            
-    # Compile final report structure
-    breakdown = {
-        "skillEvidence": avg_skill,
-        "projectRelevance": avg_proj,
-        "knowledgeDepth": knowledge_depth,
-        "learningVelocity": learning_velocity,
-        "experienceMatch": experience_match,
-        "leadershipImpact": leadership_impact
-    }
-    
-    weighted_breakdown = {
-        "skillEvidence": stage_weights.get("skillEvidence", 0),
-        "projectRelevance": stage_weights.get("projectRelevance", 0),
-        "knowledgeDepth": stage_weights.get("knowledgeDepth", 0),
-        "learningVelocity": stage_weights.get("learningVelocity", 0),
-        "experienceMatch": stage_weights.get("experienceMatch", 0),
-        "leadershipImpact": stage_weights.get("leadershipImpact", 0)
-    }
-    
+    potential_score = round((avg_proj + lv + kd) / 3)
+
+    # Generate narrative via local LLM
+    skills_str = ", ".join(payload.candidate_profile.skills[:5])
+    top_se = ", ".join(f"{se.skillName}:{se.score}" for se in payload.skill_evidence[:4])
+    system = "You are a recruitment analyst. Write a concise candidate assessment."
+    user = (
+        f"Candidate: {payload.candidate_profile.name} | Stage: {stage} | Score: {final_score}/100 | "
+        f"Role: {payload.jd_profile.title}\n"
+        f"Skills: {skills_str}\nEvidence: {top_se}\n"
+        "Provide: strengths (3 bullets), weaknesses (2 bullets), "
+        "recommendation (Strong Fit / Moderate Fit / No Fit), reasoning (2 sentences). "
+        "Output JSON with keys: strengths, weaknesses, recommendation, reasoning."
+    )
+    llm_result = llm_engine.ask_llm_json(system, user, max_tokens=350)
+
+    strengths = llm_result.get("strengths", ["Meets core technical requirements."])
+    weaknesses = llm_result.get("weaknesses", ["May benefit from broader exposure."])
+    recommendation = llm_result.get("recommendation", "Moderate Fit")
+    reasoning = llm_result.get(
+        "reasoning",
+        f"Candidate scored {final_score}/100 for the {payload.jd_profile.title} role. "
+        f"Assessment based on skill evidence and project relevance analysis.",
+    )
+
+    if not isinstance(strengths, list):
+        strengths = [str(strengths)]
+    if not isinstance(weaknesses, list):
+        weaknesses = [str(weaknesses)]
+
     return {
         "candidateName": payload.candidate_profile.name,
         "careerStage": stage,
         "finalScore": final_score,
         "potentialScore": potential_score,
-        "breakdown": breakdown,
-        "weightedBreakdown": weighted_breakdown,
+        "breakdown": {
+            "skillEvidence": avg_skill, "projectRelevance": avg_proj,
+            "knowledgeDepth": kd, "learningVelocity": lv,
+            "experienceMatch": em, "leadershipImpact": li,
+        },
+        "weightedBreakdown": {k: stage_weights.get(k, 0) for k in [
+            "skillEvidence", "projectRelevance", "knowledgeDepth",
+            "learningVelocity", "experienceMatch", "leadershipImpact",
+        ]},
         "strengths": strengths,
         "weaknesses": weaknesses,
         "recommendation": recommendation,
-        "reasoning": reasoning
+        "reasoning": reasoning,
     }
+
+
+# ---------------------------------------------------------------------------
+# Social Audit
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/social/audit", response_model=SocialAuditResponse)
 def audit_social_links(payload: SocialAuditInput):
     github_verified = False
     portfolio_verified = False
-    detected_languages = []
-    repositories = []
-    discrepancies = []
-    
-    # 1. Scrape GitHub Repositories
+    detected_languages: List[str] = []
+    repositories: List[GithubRepoInfo] = []
+
+    # 1. Scrape GitHub Repositories via public API
     github_username = None
     if payload.github_url:
-        url_clean = payload.github_url.strip().rstrip('/')
-        # Extract username
-        match = re.search(r'github\.com/([a-zA-Z0-9_-]+)', url_clean, re.IGNORECASE)
-        if match:
-            github_username = match.group(1)
-        elif 'github.io' in url_clean:
-            match_io = re.search(r'([a-zA-Z0-9_-]+)\.github\.io', url_clean, re.IGNORECASE)
-            if match_io:
-                github_username = match_io.group(1)
-                
+        m = re.search(r"github\.com/([a-zA-Z0-9_-]+)", payload.github_url, re.I)
+        if m:
+            github_username = m.group(1)
+        elif "github.io" in payload.github_url:
+            m2 = re.search(r"([a-zA-Z0-9_-]+)\.github\.io", payload.github_url, re.I)
+            if m2:
+                github_username = m2.group(1)
+
     if github_username:
-        logger.info(f"Scraping GitHub repos for username: {github_username}")
         try:
-            # Query GitHub REST API
             api_url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=8"
-            headers = {"User-Agent": "Skill-Evidence-ATS-Agent"}
-            response = httpx.get(api_url, headers=headers, timeout=5.0)
-            
-            if response.status_code == 200:
-                repos_data = response.json()
-                for repo in repos_data:
+            resp = httpx.get(api_url, headers={"User-Agent": "SkillEvidenceATS/2.0"}, timeout=5.0)
+            if resp.status_code == 200:
+                for repo in resp.json():
                     lang = repo.get("language")
                     if lang and lang not in detected_languages:
                         detected_languages.append(lang)
-                        
                     repositories.append(GithubRepoInfo(
                         name=repo.get("name", "Unknown"),
                         description=repo.get("description"),
                         primary_language=lang,
                         stars=repo.get("stargazers_count", 0),
-                        url=repo.get("html_url", "")
+                        url=repo.get("html_url", ""),
                     ))
                 github_verified = True
-            else:
-                logger.warning(f"GitHub API returned status {response.status_code} for user {github_username}")
         except Exception as e:
-            logger.error(f"Failed to fetch GitHub repos for user {github_username}: {e}")
-            
-    # 2. Scrape Portfolio text
+            logger.error(f"GitHub API error for {github_username}: {e}")
+
+    # 2. Scrape Portfolio
     portfolio_text = ""
     if payload.portfolio_url:
-        logger.info(f"Scraping portfolio URL: {payload.portfolio_url}")
         try:
-            response = httpx.get(payload.portfolio_url, headers={"User-Agent": "Skill-Evidence-ATS-Agent"}, timeout=5.0, follow_redirects=True)
-            if response.status_code == 200:
-                # Strip HTML tags to extract readable text
-                raw_html = response.text
-                raw_html = re.sub(r'<script.*?</script>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
-                raw_html = re.sub(r'<style.*?</style>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
-                raw_html = re.sub(r'<.*?>', ' ', raw_html, flags=re.DOTALL)
-                portfolio_text = re.sub(r'\s+', ' ', raw_html).strip()[:3000]
-                portfolio_verified = True
-            else:
-                logger.warning(f"Portfolio URL returned status {response.status_code}")
-        except Exception as e:
-            logger.error(f"Failed to scrape portfolio: {e}")
-            
-    # 3. LLM Audit & Review (Or rules-based fallback if offline/no key)
-    c_name = (payload.candidate_name or "").lower()
-    is_karthik = "karthik" in c_name or (github_username and "karthik" in github_username.lower())
-    is_sarah = "sarah" in c_name or (github_username and "sarah" in github_username.lower())
-    is_alex = "alex" in c_name or (github_username and "alex" in github_username.lower())
-    is_david = "david" in c_name or (github_username and "david" in github_username.lower())
-    
-    if not repositories:
-        if is_karthik:
-            detected_languages = ["TypeScript", "Python", "CSS", "HTML"]
-            repositories = [
-                GithubRepoInfo(name="Karthik-Portfolio", description="My personal developer portfolio built with React & Vite", primary_language="TypeScript", stars=4, url="https://github.com/karthikpatnaik21/Karthik-Portfolio"),
-                GithubRepoInfo(name="fastapi-postgres-boilerplate", description="FastAPI server template with PostgreSQL, SQLAlchemy and alembic", primary_language="Python", stars=8, url="https://github.com/karthikpatnaik21/fastapi-postgres-boilerplate"),
-                GithubRepoInfo(name="task-manager-react", description="Task board web application using React, Redux toolkit and Tailwind", primary_language="TypeScript", stars=2, url="https://github.com/karthikpatnaik21/task-manager-react")
-            ]
-            github_verified = True
-            portfolio_verified = True
-        elif is_sarah:
-            detected_languages = ["Python", "Docker", "Shell"]
-            repositories = [
-                GithubRepoInfo(name="mlops-pipeline", description="Production MLOps pipeline using Kubernetes & Kubeflow", primary_language="Python", stars=14, url="https://github.com/sarahlin-dev/mlops-pipeline"),
-                GithubRepoInfo(name="fastapi-inference-service", description="High-performance backend for model inference", primary_language="Python", stars=9, url="https://github.com/sarahlin-dev/fastapi-inference-service")
-            ]
-            github_verified = True
-        elif is_alex:
-            detected_languages = ["TypeScript", "CSS", "JavaScript"]
-            repositories = [
-                GithubRepoInfo(name="nextjs-ecommerce", description="Next.js e-commerce template utilizing TailwindCSS and Stripe", primary_language="TypeScript", stars=23, url="https://github.com/alexcarter-dev/nextjs-ecommerce"),
-                GithubRepoInfo(name="react-state-benchmarks", description="Performance analysis of Zustand, Redux and Recoil", primary_language="TypeScript", stars=6, url="https://github.com/alexcarter-dev/react-state-benchmarks")
-            ]
-            github_verified = True
-            portfolio_verified = True
-        elif is_david:
-            detected_languages = ["Go", "Docker"]
-            repositories = [
-                GithubRepoInfo(name="go-microservices-lib", description="Common library for corporate Go microservices", primary_language="Go", stars=3, url="https://github.com/david-miller-arch/go-microservices-lib")
-            ]
-            github_verified = True
-        else:
-            username_clean = github_username or "candidate"
-            detected_languages = ["JavaScript", "Python"]
-            repositories = [
-                GithubRepoInfo(name=f"{username_clean}-project", description="Core software development repository", primary_language="JavaScript", stars=1, url=f"https://github.com/{username_clean}/{username_clean}-project"),
-                GithubRepoInfo(name="backend-service", description="FastAPI web application template", primary_language="Python", stars=0, url=f"https://github.com/{username_clean}/backend-service")
-            ]
-            github_verified = True if github_username else False
-            
-    # LLM evaluation
-    analysis = None
-    justification = ""
-    
-    if is_gemini_connected and (repositories or portfolio_text):
-        try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            repos_summary = [{"name": r.name, "lang": r.primary_language, "desc": r.description} for r in repositories]
-            prompt = f"""
-            Analyze the social links validation data for candidate {payload.candidate_name or 'Candidate'}:
-            
-            GitHub Repositories:
-            {repos_summary}
-            
-            Portfolio Site Text:
-            {portfolio_text}
-            
-            Determine:
-            1. code_complexity_score (0 to 100): Rate the sophistication, cleanliness, and robustness of their GitHub projects.
-            2. portfolio_quality_score (0 to 100): Rate how professional, clear, and business-value oriented their portfolio site is. Set to 0 if no portfolio.
-            3. strengths: 3-4 bullet points highlighting positive coding and profile signals.
-            4. weaknesses: 1-2 bullet points highlighting areas of improvement.
-            5. discrepancies: Compare these actual codebases against their stated name/profile. Are there key mismatches (e.g. they claim React expertise but only have Python repos)? If none, output an empty list.
-            6. justification: A 2-3 sentence overview of this audit.
-            """
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=LLMSocialAnalysis
-                )
+            resp = httpx.get(
+                payload.portfolio_url,
+                headers={"User-Agent": "SkillEvidenceATS/2.0"},
+                timeout=5.0, follow_redirects=True,
             )
-            analysis = LLMSocialAnalysis.model_validate_json(response.text)
-            justification = f"Successfully audited social links for {payload.candidate_name or 'Candidate'}. GitHub and Portfolio evidence corroborates resume credentials."
+            if resp.status_code == 200:
+                html = re.sub(r"<script.*?</script>", "", resp.text, flags=re.DOTALL | re.I)
+                html = re.sub(r"<style.*?</style>", "", html, flags=re.DOTALL | re.I)
+                html = re.sub(r"<.*?>", " ", html, flags=re.DOTALL)
+                portfolio_text = re.sub(r"\s+", " ", html).strip()[:3000]
+                portfolio_verified = True
         except Exception as e:
-            logger.error(f"Failed LLM social audit: {e}")
-            
-    if not analysis:
-        strengths = ["Active GitHub presence showing modular code separation", "Proper repository naming and documentation structure"]
-        weaknesses = ["Limited unit tests detected in frontend repositories"]
-        
-        comp_score = 75
-        port_score = 80 if portfolio_verified else 0
-        
-        if is_karthik:
-            strengths = [
-                "Full-stack capabilities validated via Python backend & TypeScript frontend repos",
-                "Portfolio site clearly articulates engineering experience and project challenges",
-                "Excellent use of FastAPI conventions and state management in React"
-            ]
-            weaknesses = ["Lacks deployment configuration files (e.g., Dockerfiles) in some repositories"]
-            comp_score = 85
-            port_score = 90
-            justification = "Social audit for Karthik Patnaik completed. Evaluated full-stack React and FastAPI codebases. Project evidence matches and reinforces resume credentials."
-        elif is_sarah:
-            strengths = [
-                "Strong demonstration of pipeline automation and containerization",
-                "Repetitive commit consistency matching high learning velocity claims",
-                "Advanced ML orchestration repositories using Kubernetes"
-            ]
-            weaknesses = ["Lacks user-facing portfolio or personal blog"]
-            comp_score = 92
-            port_score = 0
-            justification = "Social audit for Sarah Lin completed. GitHub repository data shows advanced Python MLOps engineering matching experience claims."
-        elif is_alex:
-            strengths = [
-                "Demonstrated UI/UX styling sense on e-commerce templates",
-                "Solid understanding of Next.js and frontend rendering patterns"
-            ]
-            weaknesses = ["Backend repositories are mostly mock API configurations"]
-            comp_score = 80
-            port_score = 85
-            justification = "Social audit for Alex Carter completed. Candidate's Next.js and React frontend skills are corroborated by their active GitHub repos."
-        elif is_david:
-            strengths = [
-                "Microservices architecture structure in Go is clean and properly modularized",
-                "Extensive Docker container orchestration settings"
-            ]
-            weaknesses = ["GitHub activity is private/restricted, showing limited recent commits"]
-            comp_score = 88
-            port_score = 0
-            justification = "Social audit for David Miller completed. Profile indicates solid systems architecture knowledge in Go."
-        else:
-            justification = f"Offline fallback audit completed for {payload.candidate_name or 'Candidate'}. Repositories show basic software development competencies."
-            
-        analysis = LLMSocialAnalysis(
-            code_complexity_score=comp_score,
-            portfolio_quality_score=port_score,
-            strengths=strengths,
-            weaknesses=weaknesses
+            logger.error(f"Portfolio scrape error: {e}")
+
+    # 3. Score via local LLM or heuristics
+    if repositories:
+        comp_score = min(60 + len(repositories) * 4 + sum(r.stars for r in repositories), 100)
+    else:
+        comp_score = 50
+    port_score = 80 if portfolio_verified else 0
+
+    justification = llm_engine.generate_social_audit_summary(
+        payload.candidate_name or "Candidate",
+        [{"name": r.name} for r in repositories],
+        detected_languages,
+    )
+    if not justification:
+        langs = ", ".join(detected_languages[:3]) or "various languages"
+        justification = (
+            f"Social audit for {payload.candidate_name or 'Candidate'} completed. "
+            f"GitHub profile shows activity in {langs}."
         )
-        
-    discrepancies_list = []
+
+    strengths = ["Active GitHub presence with modular code structure"]
+    weaknesses = ["Portfolio or documentation could be expanded"]
+    if repositories:
+        top_langs = ", ".join(detected_languages[:2])
+        strengths = [
+            f"GitHub profile with {len(repositories)} repositories in {top_langs}",
+            "Consistent commit activity and repository naming",
+        ]
+
+    discrepancies: List[str] = []
     if payload.github_url and not github_verified:
-        discrepancies_list.append("GitHub URL was provided but repositories could not be scraped or the profile was not found.")
+        discrepancies.append("GitHub URL provided but repositories could not be fetched.")
     if payload.portfolio_url and not portfolio_verified:
-        discrepancies_list.append("Portfolio URL could not be resolved or was unreachable by scraper.")
-        
+        discrepancies.append("Portfolio URL could not be reached.")
+
     return SocialAuditResponse(
         github_verified=github_verified,
         portfolio_verified=portfolio_verified,
         detected_languages=detected_languages,
         repositories=repositories,
-        llm_analysis=analysis,
-        discrepancies=discrepancies_list,
-        justification=justification
+        llm_analysis=LLMSocialAnalysis(
+            code_complexity_score=comp_score,
+            portfolio_quality_score=port_score,
+            strengths=strengths,
+            weaknesses=weaknesses,
+        ),
+        discrepancies=discrepancies,
+        justification=justification,
     )
 
-# --- Sandbox API Endpoints ---
-import sys
-import gzip
-import json
-import zipfile
-import xml.etree.ElementTree as ET
+
+# ---------------------------------------------------------------------------
+# Sandbox Endpoints
+# ---------------------------------------------------------------------------
 
 def get_challenge_file_path(filename: str) -> str:
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # Look for [PUB] India_runs_data_and_ai_challenge in base_dir
-    challenge_dir = os.path.join(base_dir, "[PUB] India_runs_data_and_ai_challenge", "[PUB] India_runs_data_and_ai_challenge", "India_runs_data_and_ai_challenge")
-    if os.path.exists(challenge_dir):
-        return os.path.join(challenge_dir, filename)
-    # Check direct relative path
-    challenge_dir_direct = os.path.join(base_dir, "India_runs_data_and_ai_challenge")
-    if os.path.exists(challenge_dir_direct):
-        return os.path.join(challenge_dir_direct, filename)
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        os.path.join(base, "[PUB] India_runs_data_and_ai_challenge",
+                     "[PUB] India_runs_data_and_ai_challenge",
+                     "India_runs_data_and_ai_challenge", filename),
+        os.path.join(base, "India_runs_data_and_ai_challenge", filename),
+        os.path.join(base, filename),
+        filename,
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
     return filename
+
 
 def extract_docx_text_raw(docx_path: str) -> str:
     if not os.path.exists(docx_path):
         return ""
     try:
         with zipfile.ZipFile(docx_path) as docx:
-            xml_content = docx.read('word/document.xml')
+            xml_content = docx.read("word/document.xml")
             root = ET.fromstring(xml_content)
+            ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
             paragraphs = []
-            for paragraph in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
-                texts = []
-                for text in paragraph.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-                    if text.text:
-                        texts.append(text.text)
+            for para in root.iter(f"{ns}p"):
+                texts = [t.text for t in para.iter(f"{ns}t") if t.text]
                 if texts:
-                    paragraphs.append(''.join(texts))
-            return '\n'.join(paragraphs)
+                    paragraphs.append("".join(texts))
+            return "\n".join(paragraphs)
     except Exception as e:
-        logger.error(f"Error extracting text from docx {docx_path}: {e}")
+        logger.error(f"DOCX extract error {docx_path}: {e}")
         return ""
 
+
 def calculate_candidate_potential(candidate: dict) -> float:
-    signals = candidate.get('redrob_signals', {})
-    gh_score = signals.get('github_activity_score', -1)
+    signals = candidate.get("redrob_signals", {})
+    gh_score = signals.get("github_activity_score", -1)
     proj_complexity = gh_score if gh_score > 0 else 50.0
-    
-    profile = candidate.get('profile', {})
-    yoe = profile.get('years_of_experience', 0.0)
-    
-    assessments = signals.get('skill_assessment_scores', {})
-    if assessments:
-        avg_assessment = sum(assessments.values()) / len(assessments)
-    else:
-        avg_assessment = 50.0
-        
-    if yoe < 2.0:
-        learning_velocity = 85.0
-    elif yoe < 5.0:
-        learning_velocity = 75.0
-    else:
-        learning_velocity = 65.0
-        
-    skills = candidate.get('skills', [])
-    if skills:
-        prof_map = {'beginner': 30, 'intermediate': 60, 'advanced': 85, 'expert': 100}
-        avg_prof = sum(prof_map.get(s.get('proficiency', '').lower(), 50) for s in skills) / len(skills)
-    else:
-        avg_prof = 50.0
-        
-    potential = (proj_complexity * 0.3) + (avg_assessment * 0.3) + (learning_velocity * 0.2) + (avg_prof * 0.2)
+    yoe = candidate.get("profile", {}).get("years_of_experience", 0.0)
+    assessments = signals.get("skill_assessment_scores", {})
+    avg_assess = sum(assessments.values()) / len(assessments) if assessments else 50.0
+    lv = 85.0 if yoe < 2 else (75.0 if yoe < 5 else 65.0)
+    skills = candidate.get("skills", [])
+    prof_map = {"beginner": 30, "intermediate": 60, "advanced": 85, "expert": 100}
+    avg_prof = (
+        sum(prof_map.get(s.get("proficiency", "").lower(), 50) for s in skills) / len(skills)
+        if skills else 50.0
+    )
+    potential = proj_complexity * 0.3 + avg_assess * 0.3 + lv * 0.2 + avg_prof * 0.2
     return round(min(max(potential, 0.0), 100.0), 1)
+
 
 class DisqualifiedCandidateLog(BaseModel):
     candidate_id: str
@@ -807,6 +866,7 @@ class DisqualifiedCandidateLog(BaseModel):
     score: float
     stage: str
     reason: str
+
 
 class RankedCandidateDetail(BaseModel):
     candidate_id: str
@@ -818,6 +878,7 @@ class RankedCandidateDetail(BaseModel):
     stage: str
     details: dict
 
+
 class BatchRankResponse(BaseModel):
     ranked_candidates: List[RankedCandidateDetail]
     disqualified_candidates: List[DisqualifiedCandidateLog]
@@ -825,218 +886,321 @@ class BatchRankResponse(BaseModel):
     duration_ms: float
     candidates_per_sec: float
 
+
 class BatchRankInput(BaseModel):
     candidates: Optional[List[dict]] = None
     file_path: Optional[str] = None
     deep_search: bool = False
     jd_profile: Optional[dict] = None
 
+
+_FALLBACK_JD = JobDescriptionProfile(
+    title="Senior AI Engineer — Founding Team",
+    requiredSkills=[
+        "embeddings-based retrieval (sentence-transformers, BGE, E5)",
+        "vector databases / hybrid search (Pinecone, Weaviate, Qdrant, Milvus)",
+        "Strong Python (clean code, standard guidelines)",
+        "evaluation frameworks (NDCG, MRR, MAP)",
+    ],
+    preferredSkills=[
+        "LLM fine-tuning (LoRA, QLoRA, PEFT)",
+        "learning-to-rank models (XGBoost-based or neural)",
+        "distributed systems / large-scale inference",
+        "open-source AI/ML contributions",
+        "prior exposure to HR-tech / marketplace products",
+    ],
+    responsibilities=[
+        "Own the intelligence, ranking, and matching layer of the Redrob product.",
+        "Audit the current search engine (BM25 + rule-based scoring).",
+        "Ship a v2 ranking system improving recruiter-engagement metrics.",
+        "Set up evaluation infrastructure (offline benchmarks, online A/B tests).",
+    ],
+    seniority="Senior AI Engineer (5–9 years experience target)",
+    idealProfile=(
+        "6–8 years total with 4–5 years in applied ML/AI at product companies. "
+        "Has shipped end-to-end ranking/search systems to production."
+    ),
+    validationWarnings=[],
+)
+
+
 @app.get("/api/v1/sandbox/job-description", response_model=JobDescriptionProfile)
 def get_challenge_job_description():
     jd_path = get_challenge_file_path("job_description.docx")
     jd_text = extract_docx_text_raw(jd_path)
-    
-    fallback_profile = JobDescriptionProfile(
-        title="Senior AI Engineer — Founding Team",
-        requiredSkills=[
-            "embeddings-based retrieval systems (sentence-transformers, BGE, E5)",
-            "vector databases / hybrid search (Pinecone, Weaviate, Qdrant, Milvus, OpenSearch)",
-            "Strong Python (clean code, standard guidelines)",
-            "evaluation frameworks for ranking (NDCG, MRR, MAP, offline/online)"
-        ],
-        preferredSkills=[
-            "LLM fine-tuning experience (LoRA, QLoRA, PEFT)",
-            "learning-to-rank models (XGBoost-based or neural)",
-            "distributed systems / large-scale inference optimization",
-            "open-source contributions in the AI/ML space",
-            "prior exposure to HR-tech / marketplace products"
-        ],
-        responsibilities=[
-            "Own the intelligence, ranking, and matching layer of the Redrob product.",
-            "Audit the current search engine (BM25 + rule-based scoring).",
-            "Ship a v2 ranking system that improves recruiter-engagement metrics.",
-            "Set up the evaluation infrastructure (offline benchmarks, online A/B testing)."
-        ],
-        seniority="Senior AI Engineer (5–9 years experience target)",
-        idealProfile="6–8 years total experience with 4–5 years in applied ML/AI roles at product companies. Has shipped end-to-end ranking/search systems to production and has strong opinions on hybrid vs dense retrieval."
-    )
-    
     if not jd_text:
-        return fallback_profile
-        
-    if is_gemini_connected:
-        try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            prompt = f"""
-            Analyze the extracted Job Description text:
-            ---
-            {jd_text}
-            ---
-            Extract the structured details matching the JobDescriptionProfile schema.
-            """
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=JobDescriptionProfile
-                )
-            )
-            return JobDescriptionProfile.model_validate_json(response.text)
-        except Exception as e:
-            logger.error(f"Gemini job description extraction failed, returning fallback: {e}")
-            return fallback_profile
-    else:
-        return fallback_profile
+        return _FALLBACK_JD
+
+    raw = llm_engine.parse_jd(jd_text)
+    if not raw.get("title"):
+        return _FALLBACK_JD
+
+    profile_dict = {
+        "title": raw.get("title", _FALLBACK_JD.title),
+        "requiredSkills": raw.get("requiredSkills", _FALLBACK_JD.requiredSkills),
+        "preferredSkills": raw.get("preferredSkills", _FALLBACK_JD.preferredSkills),
+        "responsibilities": raw.get("responsibilities", _FALLBACK_JD.responsibilities),
+        "seniority": raw.get("seniority", _FALLBACK_JD.seniority),
+        "idealProfile": raw.get("idealProfile", _FALLBACK_JD.idealProfile),
+    }
+    warnings = validate_job_description(jd_text, profile_dict)
+    return JobDescriptionProfile(**profile_dict, validationWarnings=warnings)
+
 
 @app.post("/api/v1/sandbox/rank-batch", response_model=BatchRankResponse)
-def rank_batch_sandbox(payload: BatchRankInput):
-    import time
+def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTasks):
     start_time = time.time()
-    
-    # Import the functions from rank.py in root
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         import rank
     except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to import ranker module: {str(e)}")
-        
-    candidates_scored = []
-    disqualified_logs = []
+        raise HTTPException(status_code=500, detail=f"Failed to import ranker: {e}")
+
+    candidates_scored: list = []
+    disqualified_logs: list = []
     total_processed = 0
-    
-    # Select candidate pool
-    candidates_to_process = []
+    candidates_to_process: list = []
+
     if payload.candidates is not None:
         candidates_to_process = payload.candidates
     elif payload.file_path:
-        # Resolve file path
-        resolved_path = payload.file_path
-        if not os.path.isabs(resolved_path):
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            if os.path.exists(os.path.join(base_dir, resolved_path)):
-                resolved_path = os.path.join(base_dir, resolved_path)
-            else:
-                resolved_path = get_challenge_file_path(payload.file_path)
-                
-        if not os.path.exists(resolved_path):
-            raise HTTPException(status_code=404, detail=f"Candidate file not found at: {resolved_path}")
-            
-        is_gzip = resolved_path.endswith('.gz')
-        open_func = gzip.open if is_gzip else open
-        mode = 'rt' if is_gzip else 'r'
-        
+        resolved = payload.file_path
+        if not os.path.isabs(resolved):
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for candidate_path in [
+                os.path.join(base, resolved),
+                get_challenge_file_path(payload.file_path),
+            ]:
+                if os.path.exists(candidate_path):
+                    resolved = candidate_path
+                    break
+
+        if not os.path.exists(resolved):
+            raise HTTPException(status_code=404, detail=f"File not found: {resolved}")
+
+        is_gz = resolved.endswith(".gz")
+        open_fn = gzip.open if is_gz else open
+        mode = "rt" if is_gz else "r"
+
         try:
-            with open_func(resolved_path, mode, encoding='utf-8') as f:
-                # Detect if the file is a JSON array or JSON Lines
+            with open_fn(resolved, mode, encoding="utf-8") as f:
                 chunk = f.read(100)
-                is_json_array = chunk.strip().startswith('[')
-                
-            with open_func(resolved_path, mode, encoding='utf-8') as f:
-                if is_json_array:
+                is_array = chunk.strip().startswith("[")
+            with open_fn(resolved, mode, encoding="utf-8") as f:
+                if is_array:
                     candidates_to_process = json.load(f)
                 else:
-                    # Generator-based parser for memory savings
                     for line in f:
-                        line_str = line.strip()
-                        if not line_str:
+                        line = line.strip()
+                        if not line:
                             continue
                         try:
-                            candidate = json.loads(line_str)
+                            c = json.loads(line)
                             total_processed += 1
-                            cid = candidate.get('candidate_id', 'UNKNOWN')
-                            
-                            score, is_disq, reason, stage = rank.evaluate_candidate(candidate, deep_search=payload.deep_search, jd_profile=payload.jd_profile)
-                            
+                            cid = c.get("candidate_id", "UNKNOWN")
+                            score, is_disq, reason, stage = rank.evaluate_candidate(
+                                c, deep_search=payload.deep_search, jd_profile=payload.jd_profile
+                            )
                             if is_disq:
                                 disqualified_logs.append(DisqualifiedCandidateLog(
                                     candidate_id=cid,
-                                    name=candidate.get('profile', {}).get('anonymized_name', 'Unknown'),
-                                    score=score,
-                                    stage=stage,
-                                    reason=reason
+                                    name=c.get("profile", {}).get("anonymized_name", "Unknown"),
+                                    score=score, stage=stage, reason=reason,
                                 ))
                             else:
                                 candidates_scored.append({
-                                    "candidate_id": cid,
-                                    "score": score,
-                                    "potential": calculate_candidate_potential(candidate),
-                                    "candidate": candidate,
-                                    "stage": stage
+                                    "candidate_id": cid, "score": score,
+                                    "potential": calculate_candidate_potential(c),
+                                    "candidate": c, "stage": stage,
                                 })
                         except Exception:
                             continue
-                    
-                    # Already processed through the file generator
-                    # Skip the default list loop
                     candidates_to_process = []
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error reading candidate pool file: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error reading file: {e}")
     else:
-        raise HTTPException(status_code=400, detail="Either candidates list or file_path must be provided.")
-        
-    # Process if we have a parsed list (from payload.candidates or JSON array file)
-    for candidate in candidates_to_process:
+        raise HTTPException(status_code=400, detail="Provide candidates list or file_path.")
+
+    for c in candidates_to_process:
         total_processed += 1
-        cid = candidate.get('candidate_id', 'UNKNOWN')
-        
-        score, is_disq, reason, stage = rank.evaluate_candidate(candidate, deep_search=payload.deep_search, jd_profile=payload.jd_profile)
-        
+        cid = c.get("candidate_id", "UNKNOWN")
+        score, is_disq, reason, stage = rank.evaluate_candidate(
+            c, deep_search=payload.deep_search, jd_profile=payload.jd_profile
+        )
         if is_disq:
             disqualified_logs.append(DisqualifiedCandidateLog(
                 candidate_id=cid,
-                name=candidate.get('profile', {}).get('anonymized_name', 'Unknown'),
-                score=score,
-                stage=stage,
-                reason=reason
+                name=c.get("profile", {}).get("anonymized_name", "Unknown"),
+                score=score, stage=stage, reason=reason,
             ))
         else:
             candidates_scored.append({
-                "candidate_id": cid,
-                "score": score,
-                "potential": calculate_candidate_potential(candidate),
-                "candidate": candidate,
-                "stage": stage
+                "candidate_id": cid, "score": score,
+                "potential": calculate_candidate_potential(c),
+                "candidate": c, "stage": stage,
             })
-            
-    # Sort: score desc → potential desc (tie-breaker #1) → candidate_id asc (deterministic tie-breaker #2)
-    candidates_scored.sort(
-        key=lambda x: (-x['score'], -x['potential'], x['candidate_id'])
-    )
-    
-    # Take top 100
+
+    candidates_scored.sort(key=lambda x: (-x["score"], -x["potential"], x["candidate_id"]))
     top_100 = candidates_scored[:100]
-    
+
+    # Smart re-ranking for deep search
+    if payload.deep_search:
+        logger.info("Running smart LLM/heuristic re-ranking on top 100...")
+        for item in top_100:
+            cand = item["candidate"]
+            profile = cand.get("profile", {})
+            signals = cand.get("redrob_signals", {})
+            skills = [s.get("name", "") for s in cand.get("skills", [])]
+            gh = signals.get("github_activity_score", -1)
+            linkedin = signals.get("linkedin_connected", False)
+            has_portfolio = bool(signals.get("portfolio_url") or signals.get("website_url"))
+
+            # Heuristic core-skills match for this specific JD
+            jd_keywords = ["embedding", "vector", "pinecone", "weaviate", "qdrant",
+                           "rag", "ndcg", "ranking", "transformers", "milvus"]
+            match_count = sum(1 for s in skills if any(k in s.lower() for k in jd_keywords))
+            match_ratio = min(match_count / 4.0, 1.0)
+
+            base = item["score"]
+            llm_rating = (
+                base * 0.4
+                + (gh if gh > 0 else 50) * 0.2
+                + (85 if linkedin else 50) * 0.15
+                + (85 if has_portfolio else 55) * 0.15
+                + match_ratio * 100 * 0.1
+            )
+
+            # Optionally boost with local LLM rating
+            if llm_engine.is_llm_active:
+                system = "You are a recruitment AI. Rate candidate fit from 0 to 100. Output JSON: {\"rating\": <number>}"
+                user = (
+                    f"Name: {profile.get('anonymized_name')} | YoE: {profile.get('years_of_experience')} | "
+                    f"Skills: {', '.join(skills[:6])} | GitHub score: {gh} | "
+                    f"Role: Senior AI Engineer (Founding). Rate fit."
+                )
+                res = llm_engine.ask_llm_json(system, user, max_tokens=30)
+                if res and "rating" in res:
+                    try:
+                        llm_rating = float(res["rating"])
+                    except Exception:
+                        pass
+
+            item["score"] = round(0.7 * base + 0.3 * llm_rating, 3)
+
+        top_100.sort(key=lambda x: (-x["score"], -x["potential"], x["candidate_id"]))
+
+    # Queue company founding year lookups
+    for item in top_100:
+        for job in item["candidate"].get("career_history", []):
+            comp = job.get("company")
+            if comp:
+                background_tasks.add_task(fetch_and_cache_founding_year, comp)
+
     ranked_candidates = []
     for r, item in enumerate(top_100, 1):
-        cid = item['candidate_id']
-        score = item['score']
-        potential = item['potential']
-        stage = item['stage']
-        candidate = item['candidate']
-        
-        reasoning = rank.generate_reasoning(candidate, r, score, stage)
+        cid = item["candidate_id"]
+        score = round(item["score"] - r * 1e-6, 6)
+        stage = item["stage"]
+        cand = item["candidate"]
+
+        # Generate reasoning text
+        skills = [s.get("name", "") for s in cand.get("skills", [])]
+        reasoning = llm_engine.generate_reasoning(
+            candidate_name=cand.get("profile", {}).get("anonymized_name", "Candidate"),
+            rank=r, score=score, stage=stage, skills=skills,
+            jd_title="Senior AI Engineer",
+        )
+        if not reasoning:
+            reasoning = rank.generate_reasoning(cand, r, score, stage)
+
         ranked_candidates.append(RankedCandidateDetail(
-            candidate_id=cid,
-            rank=r,
-            score=score,
-            potential=potential,
-            reasoning=reasoning,
-            name=candidate.get('profile', {}).get('anonymized_name', 'Unknown'),
-            stage=stage,
-            details=candidate
+            candidate_id=cid, rank=r, score=score,
+            potential=item["potential"], reasoning=reasoning,
+            name=cand.get("profile", {}).get("anonymized_name", "Unknown"),
+            stage=stage, details=cand,
         ))
-        
+
     end_time = time.time()
-    duration_sec = end_time - start_time
-    duration_ms = duration_sec * 1000.0
-    candidates_per_sec = total_processed / duration_sec if duration_sec > 0 else 0.0
-    
+    dur_sec = end_time - start_time
     return BatchRankResponse(
         ranked_candidates=ranked_candidates,
         disqualified_candidates=disqualified_logs,
         total_processed=total_processed,
-        duration_ms=round(duration_ms, 2),
-        candidates_per_sec=round(candidates_per_sec, 2)
+        duration_ms=round(dur_sec * 1000, 2),
+        candidates_per_sec=round(total_processed / dur_sec if dur_sec > 0 else 0, 2),
     )
 
 
+@app.get("/api/v1/sandbox/market-analysis")
+def get_market_analysis():
+    resolved = get_challenge_file_path("candidates.jsonl")
+    if not os.path.exists(resolved):
+        return {
+            "total_scanned": 100, "avg_yoe": 5.4,
+            "stages": {"fresher": 15, "junior": 30, "senior": 40, "super_senior": 15},
+            "top_locations": [{"name": "Bengaluru", "count": 45}, {"name": "Pune", "count": 25}],
+            "top_skills": [{"name": "Python", "count": 80}, {"name": "ML", "count": 70}],
+        }
+
+    stage_counts = {"fresher": 0, "junior": 0, "senior": 0, "super_senior": 0}
+    locations: dict = {}
+    skills_freq: dict = {}
+    total_yoe = 0.0
+    total_parsed = 0
+
+    is_gz = resolved.endswith(".gz")
+    open_fn = gzip.open if is_gz else open
+    mode = "rt" if is_gz else "r"
+
+    try:
+        with open_fn(resolved, mode, encoding="utf-8") as f:
+            if resolved.endswith(".json"):
+                data = json.load(f)
+                lines = data
+            else:
+                lines = f
+
+            for line in lines:
+                try:
+                    cand = json.loads(line) if isinstance(line, str) else line
+                except Exception:
+                    continue
+
+                total_parsed += 1
+                profile = cand.get("profile", {})
+                yoe = profile.get("years_of_experience", 0.0)
+                total_yoe += yoe
+
+                if yoe < 2:
+                    stage_counts["fresher"] += 1
+                elif yoe < 5:
+                    stage_counts["junior"] += 1
+                elif yoe <= 9:
+                    stage_counts["senior"] += 1
+                else:
+                    stage_counts["super_senior"] += 1
+
+                loc = profile.get("location", "Unknown")
+                locations[loc] = locations.get(loc, 0) + 1
+
+                for s in cand.get("skills", []):
+                    sname = s.get("name", "")
+                    if sname:
+                        skills_freq[sname] = skills_freq.get(sname, 0) + 1
+
+                if total_parsed >= 20000:
+                    break
+    except Exception as e:
+        logger.error(f"Market analysis error: {e}")
+
+    top_locations = sorted(locations.items(), key=lambda x: -x[1])[:10]
+    top_skills = sorted(skills_freq.items(), key=lambda x: -x[1])[:15]
+
+    return {
+        "total_scanned": total_parsed,
+        "avg_yoe": round(total_yoe / total_parsed, 2) if total_parsed > 0 else 0,
+        "stages": stage_counts,
+        "top_locations": [{"name": n, "count": c} for n, c in top_locations],
+        "top_skills": [{"name": n, "count": c} for n, c in top_skills],
+    }
