@@ -8,6 +8,11 @@ import re
 import json
 import logging
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 logger = logging.getLogger("llm-engine")
 
 # ---------------------------------------------------------------------------
@@ -36,15 +41,63 @@ def initialize() -> bool:
 
     try:
         from llama_cpp import Llama
-        from huggingface_hub import hf_hub_download
     except ImportError as e:
-        logger.warning(f"llama-cpp-python or huggingface-hub not installed: {e}")
+        logger.warning(f"llama-cpp-python not installed: {e}")
         return False
 
-    for repo_id, filename in _MODEL_OPTIONS:
+    # 1. Check for custom local model path override
+    local_path = os.getenv("LOCAL_MODEL_PATH")
+    if local_path:
+        local_path = local_path.strip('\'"')
+        if os.path.exists(local_path):
+            try:
+                logger.info(f"Attempting to load local model directly from: {local_path}")
+                _llm = Llama(
+                    model_path=local_path,
+                    n_ctx=4096,
+                    n_threads=min(os.cpu_count() or 4, 6),  # use up to 6 cores
+                    n_batch=512,
+                    verbose=False,
+                )
+                is_llm_active = True
+                loaded_model_name = os.path.basename(local_path)
+                logger.info(f"✅ Local LLM loaded from file: {loaded_model_name}")
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to load local model from {local_path}: {e}")
+        else:
+            logger.warning(f"LOCAL_MODEL_PATH specified but file does not exist: {local_path}")
+
+    # 2. Check for Hugging Face Hub downloads (custom repo or defaults)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        logger.warning(f"huggingface-hub not installed; cannot download model: {e}")
+        return False
+
+    # Build model options starting with custom configuration if provided
+    hf_options = []
+    custom_repo = os.getenv("HF_MODEL_REPO_ID")
+    custom_file = os.getenv("HF_MODEL_FILENAME")
+    if custom_repo and custom_file:
+        hf_options.append((custom_repo.strip('\'"'), custom_file.strip('\'"')))
+    
+    # Add defaults as fallback
+    hf_options.extend(_MODEL_OPTIONS)
+
+    cache_dir = os.getenv("HF_CACHE_DIR")
+    if cache_dir:
+        cache_dir = cache_dir.strip('\'"')
+        logger.info(f"Using custom Hugging Face cache directory: {cache_dir}")
+
+    for repo_id, filename in hf_options:
         try:
-            logger.info(f"Attempting to load model: {filename} from {repo_id}")
-            model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            logger.info(f"Attempting to load HF model: {filename} from repo {repo_id}")
+            download_kwargs = {"repo_id": repo_id, "filename": filename}
+            if cache_dir:
+                download_kwargs["cache_dir"] = cache_dir
+
+            model_path = hf_hub_download(**download_kwargs)
             _llm = Llama(
                 model_path=model_path,
                 n_ctx=4096,
@@ -57,7 +110,7 @@ def initialize() -> bool:
             logger.info(f"✅ Local LLM loaded: {filename}")
             return True
         except Exception as e:
-            logger.warning(f"Failed to load {filename}: {e}")
+            logger.warning(f"Failed to load HF model {filename} from {repo_id}: {e}")
             continue
 
     logger.warning("⚠️  No local GGUF model could be loaded. Using heuristic fallbacks.")

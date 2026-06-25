@@ -15,7 +15,6 @@ This is the FastAPI-based backend server for the **Skill Evidence ATS** system. 
 
 ### Prerequisites
 - **Python 3.9+** (Required)
-- **Google Gemini API Key** (*Can be avoided / Optional*): If not provided via the `GEMINI_API_KEY` environment variable in a `.env` file, the backend automatically detects this and falls back to offline/local simulation/mock mode for all resume and JD parser features.
 
 ### Setup & Run
 1. Create a virtual environment and activate it:
@@ -27,10 +26,28 @@ This is the FastAPI-based backend server for the **Skill Evidence ATS** system. 
    ```bash
    pip install -r requirements.txt
    ```
-3. Run the development server:
+3. (Optional) Configure custom Local GGUF LLM settings in a `.env` file (see the "Adjusting Local GGUF LLM Settings" section below).
+4. Run the development server:
    ```bash
    python -m uvicorn main:app --reload --port 8000
    ```
+
+### ⚙️ Adjusting Local GGUF LLM Settings
+By default, the backend downloads and caches the Qwen2.5 model files from Hugging Face Hub. You can customize where the GGUF model is loaded or downloaded by copying `backend/.env.example` to `backend/.env` and editing the following variables:
+
+* **Direct Local Path Loading:** Point `LOCAL_MODEL_PATH` to an existing `.gguf` file on your local disk to bypass Hugging Face downloads entirely. This is highly useful if you have pre-downloaded custom models:
+  ```env
+  LOCAL_MODEL_PATH="C:\path\to\your\model.gguf"
+  ```
+* **Custom Hugging Face Download:** Specify a custom GGUF model repository and file to download:
+  ```env
+  HF_MODEL_REPO_ID="Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+  HF_MODEL_FILENAME="qwen2.5-1.5b-instruct-q4_k_m.gguf"
+  ```
+* **Custom Download Location:** Override the local caching directory where downloaded Hugging Face models are stored:
+  ```env
+  HF_CACHE_DIR="D:\models\huggingface"
+  ```
 
 ---
 
