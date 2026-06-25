@@ -237,6 +237,8 @@ class DeepReviewSignals(BaseModel):
     linkedinChecked: bool = False
     portfolioChecked: bool = False
     websiteChecked: bool = False
+    githubQualityScore: Optional[float] = None
+    portfolioQualityScore: Optional[float] = None
 
 
 class RankCalculationInput(BaseModel):
@@ -634,14 +636,20 @@ def rank_candidate(payload: RankCalculationInput):
             total_weight += w
 
     base_score = round(total_score / total_weight) if total_weight > 0 else 0
-    bonus = 0
+    bonus = 0.0
     if payload.deep_review_signals:
-        bonus += 3 if payload.deep_review_signals.githubChecked else 0
-        bonus += 2 if payload.deep_review_signals.linkedinChecked else 0
-        bonus += 3 if payload.deep_review_signals.portfolioChecked else 0
-        bonus += 2 if payload.deep_review_signals.websiteChecked else 0
+        if payload.deep_review_signals.githubChecked:
+            q = payload.deep_review_signals.githubQualityScore if payload.deep_review_signals.githubQualityScore is not None else 0.0
+            bonus += (q / 100.0) * 3.0
+        if payload.deep_review_signals.linkedinChecked:
+            bonus += 2.0
+        if payload.deep_review_signals.portfolioChecked:
+            q = payload.deep_review_signals.portfolioQualityScore if payload.deep_review_signals.portfolioQualityScore is not None else 0.0
+            bonus += (q / 100.0) * 3.0
+        if payload.deep_review_signals.websiteChecked:
+            bonus += 2.0
 
-    final_score = min(base_score + bonus, 100)
+    final_score = min(base_score + round(bonus), 100)
     potential_score = round((avg_proj + lv + kd) / 3)
 
     # Generate narrative via local LLM
