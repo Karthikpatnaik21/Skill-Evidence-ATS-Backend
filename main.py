@@ -8,7 +8,7 @@ import threading
 import time
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import List, Optional
+from typing import List, Optional, Union
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -900,6 +900,7 @@ class BatchRankInput(BaseModel):
     file_path: Optional[str] = None
     deep_search: bool = False
     jd_profile: Optional[dict] = None
+    location_priority: Optional[Union[str, List[str]]] = None
 
 
 _FALLBACK_JD = JobDescriptionProfile(
@@ -959,6 +960,13 @@ def get_challenge_job_description():
 def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTasks):
     start_time = time.time()
 
+    location_priorities = None
+    if payload.location_priority:
+        if isinstance(payload.location_priority, list):
+            location_priorities = [loc.strip() for loc in payload.location_priority if loc.strip()]
+        elif isinstance(payload.location_priority, str):
+            location_priorities = [loc.strip() for loc in payload.location_priority.split(',') if loc.strip()]
+
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         import rank
@@ -1008,7 +1016,7 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
                             total_processed += 1
                             cid = c.get("candidate_id", "UNKNOWN")
                             score, is_disq, reason, stage = rank.evaluate_candidate(
-                                c, deep_search=payload.deep_search, jd_profile=payload.jd_profile
+                                c, deep_search=payload.deep_search, jd_profile=payload.jd_profile, location_priority=location_priorities
                             )
                             if is_disq:
                                 disqualified_logs.append(DisqualifiedCandidateLog(
@@ -1034,7 +1042,7 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
         total_processed += 1
         cid = c.get("candidate_id", "UNKNOWN")
         score, is_disq, reason, stage = rank.evaluate_candidate(
-            c, deep_search=payload.deep_search, jd_profile=payload.jd_profile
+            c, deep_search=payload.deep_search, jd_profile=payload.jd_profile, location_priority=location_priorities
         )
         if is_disq:
             disqualified_logs.append(DisqualifiedCandidateLog(
@@ -1141,7 +1149,7 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
 
 
 @app.get("/api/v1/sandbox/market-analysis")
-def get_market_analysis():
+def get_market_analysis(limit: int = 20000):
     resolved = get_challenge_file_path("candidates.jsonl")
     if not os.path.exists(resolved):
         return {
@@ -1197,7 +1205,7 @@ def get_market_analysis():
                     if sname:
                         skills_freq[sname] = skills_freq.get(sname, 0) + 1
 
-                if total_parsed >= 20000:
+                if total_parsed >= limit:
                     break
     except Exception as e:
         logger.error(f"Market analysis error: {e}")
