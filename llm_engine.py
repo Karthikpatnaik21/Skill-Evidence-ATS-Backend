@@ -226,10 +226,10 @@ def _heuristic_parse_jd(jd_text: str) -> dict:
 
     # Seniority
     seniority = "Mid-level (3-5 years)"
-    if any(k in ltext for k in ["fresher", "entry-level", "entry level", "0-2 years", "0 to 2 years", "intern"]):
-        seniority = "Fresher / Entry-level (0-2 years)"
-    elif any(k in ltext for k in ["senior", "lead", "principal", "staff", "5+ years", "7+ years", "8+ years"]):
+    if re.search(r"\b(senior|lead|principal|staff|5\+?\s*years|7\+?\s*years|8\+?\s*years|9\+?\s*years)\b", ltext):
         seniority = "Senior / Lead (5+ years)"
+    elif re.search(r"\b(fresher|entry[- ]level|0[- ]2\s*years|0\s+to\s+2\s*years|intern(ship)?s?)\b", ltext):
+        seniority = "Fresher / Entry-level (0-2 years)"
 
     found = [s for s in _KNOWN_SKILLS if s.lower() in ltext]
     split = max(1, int(len(found) * 0.6))

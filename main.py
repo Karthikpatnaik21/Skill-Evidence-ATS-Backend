@@ -426,8 +426,10 @@ def validate_job_description(jd_text: str, profile_dict: dict) -> List[str]:
     seniority = (profile_dict.get("seniority") or "").lower()
 
     # 1. Fresher + high YoE requirement
-    is_fresher = any(k in ltext for k in ["fresher", "entry-level", "entry level"]) or \
-                 any(k in seniority for k in ["fresher", "entry-level", "0-2 years"])
+    is_fresher = (
+        re.search(r"\b(fresher|entry[- ]level|intern(ship)?s?)\b", ltext) is not None or
+        any(k in seniority for k in ["fresher", "entry-level", "0-2 years", "intern"])
+    ) and not any(k in seniority for k in ["senior", "lead", "principal", "staff", "mid-level", "3-5 years", "5+ years"])
     if is_fresher:
         yoe_hits = re.findall(r"\b([3-9]|\d{2,})\+?\s*years?\b", ltext)
         if yoe_hits:
@@ -874,6 +876,8 @@ class DisqualifiedCandidateLog(BaseModel):
     score: float
     stage: str
     reason: str
+    potential: float = 0.0
+    details: dict = Field(default_factory=dict)
 
 
 class RankedCandidateDetail(BaseModel):
@@ -901,6 +905,7 @@ class BatchRankInput(BaseModel):
     deep_search: bool = False
     jd_profile: Optional[dict] = None
     location_priority: Optional[Union[str, List[str]]] = None
+    include_disqualified_details: bool = False
 
 
 _FALLBACK_JD = JobDescriptionProfile(
@@ -1023,6 +1028,8 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
                                     candidate_id=cid,
                                     name=c.get("profile", {}).get("anonymized_name", "Unknown"),
                                     score=score, stage=stage, reason=reason,
+                                    potential=calculate_candidate_potential(c) if payload.include_disqualified_details else 0.0,
+                                    details=c if payload.include_disqualified_details else {},
                                 ))
                             else:
                                 candidates_scored.append({
@@ -1049,6 +1056,8 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
                 candidate_id=cid,
                 name=c.get("profile", {}).get("anonymized_name", "Unknown"),
                 score=score, stage=stage, reason=reason,
+                potential=calculate_candidate_potential(c) if payload.include_disqualified_details else 0.0,
+                details=c if payload.include_disqualified_details else {},
             ))
         else:
             candidates_scored.append({
@@ -1220,3 +1229,6 @@ def get_market_analysis(limit: int = 20000):
         "top_locations": [{"name": n, "count": c} for n, c in top_locations],
         "top_skills": [{"name": n, "count": c} for n, c in top_skills],
     }
+
+# Hot-reload trigger comment to load new ranker module (v5).
+
