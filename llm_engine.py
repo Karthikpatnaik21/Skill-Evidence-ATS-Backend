@@ -441,6 +441,9 @@ def _heuristic_parse_resume(text: str) -> dict:
 def generate_reasoning(candidate_name: str, rank: int, score: float,
                         stage: str, skills: list[str], jd_title: str) -> str:
     """Generate a 1-2 sentence recruiting summary for a ranked candidate."""
+    # [DISABLED FOR SPEED] Generating narratives via LLM for 100+ candidates in batch takes too long.
+    # Bypassing this ensures the system relies on the fast heuristic summarizer below.
+    """
     if is_llm_active:
         system = "You are a concise technical recruiting assistant. Write 1-2 professional sentences."
         user = (
@@ -451,13 +454,11 @@ def generate_reasoning(candidate_name: str, rank: int, score: float,
         text = ask_llm_text(system, user, max_tokens=120)
         if text:
             return text
+    """
 
     # Heuristic fallback
-    top = ", ".join(skills[:4]) if skills else "general engineering"
-    return (
-        f"Candidate {candidate_name} is ranked #{rank} with a score of {score:.1f}. "
-        f"Profile demonstrates {stage}-level expertise, particularly in {top}."
-    )
+    # Return empty so the caller (main.py) falls back to the advanced rank.py logic
+    return ""
 
 
 def generate_social_audit_summary(candidate_name: str, repos: list, languages: list) -> str:

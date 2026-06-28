@@ -961,7 +961,7 @@ def get_challenge_job_description():
     return JobDescriptionProfile(**profile_dict, validationWarnings=warnings)
 
 
-@app.post("/api/v1/sandbox/rank-batch", response_model=BatchRankResponse)
+@app.post("/api/v1/sandbox/rank-batch")
 def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTasks):
     start_time = time.time()
 
@@ -1024,13 +1024,13 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
                                 c, deep_search=payload.deep_search, jd_profile=payload.jd_profile, location_priority=location_priorities
                             )
                             if is_disq:
-                                disqualified_logs.append(DisqualifiedCandidateLog(
-                                    candidate_id=cid,
-                                    name=c.get("profile", {}).get("anonymized_name", "Unknown"),
-                                    score=score, stage=stage, reason=reason,
-                                    potential=calculate_candidate_potential(c) if payload.include_disqualified_details else 0.0,
-                                    details=c if payload.include_disqualified_details else {},
-                                ))
+                                disqualified_logs.append({
+                                    "candidate_id": cid,
+                                    "name": c.get("profile", {}).get("anonymized_name", "Unknown"),
+                                    "score": score, "stage": stage, "reason": reason,
+                                    "potential": calculate_candidate_potential(c) if payload.include_disqualified_details else 0.0,
+                                    "details": c if payload.include_disqualified_details else {},
+                                })
                             else:
                                 candidates_scored.append({
                                     "candidate_id": cid, "score": score,
@@ -1052,13 +1052,13 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
             c, deep_search=payload.deep_search, jd_profile=payload.jd_profile, location_priority=location_priorities
         )
         if is_disq:
-            disqualified_logs.append(DisqualifiedCandidateLog(
-                candidate_id=cid,
-                name=c.get("profile", {}).get("anonymized_name", "Unknown"),
-                score=score, stage=stage, reason=reason,
-                potential=calculate_candidate_potential(c) if payload.include_disqualified_details else 0.0,
-                details=c if payload.include_disqualified_details else {},
-            ))
+            disqualified_logs.append({
+                "candidate_id": cid,
+                "name": c.get("profile", {}).get("anonymized_name", "Unknown"),
+                "score": score, "stage": stage, "reason": reason,
+                "potential": calculate_candidate_potential(c) if payload.include_disqualified_details else 0.0,
+                "details": c if payload.include_disqualified_details else {},
+            })
         else:
             candidates_scored.append({
                 "candidate_id": cid, "score": score,
@@ -1096,7 +1096,9 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
                 + match_ratio * 100 * 0.1
             )
 
-            # Optionally boost with local LLM rating
+            # [DISABLED FOR SPEED] Calling LLM per candidate for 100+ batch candidates is too slow.
+            # Using the fast heuristic rating calculated above instead.
+            """
             if llm_engine.is_llm_active:
                 system = "You are a recruitment AI. Rate candidate fit from 0 to 100. Output JSON: {\"rating\": <number>}"
                 user = (
@@ -1110,6 +1112,7 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
                         llm_rating = float(res["rating"])
                     except Exception:
                         pass
+            """
 
             item["score"] = round(0.7 * base + 0.3 * llm_rating, 3)
 
@@ -1139,22 +1142,24 @@ def rank_batch_sandbox(payload: BatchRankInput, background_tasks: BackgroundTask
         if not reasoning:
             reasoning = rank.generate_reasoning(cand, r, score, stage)
 
-        ranked_candidates.append(RankedCandidateDetail(
-            candidate_id=cid, rank=r, score=score,
-            potential=item["potential"], reasoning=reasoning,
-            name=cand.get("profile", {}).get("anonymized_name", "Unknown"),
-            stage=stage, details=cand,
-        ))
+        ranked_candidates.append({
+            "candidate_id": cid, "rank": r, "score": score,
+            "potential": item["potential"], "reasoning": reasoning,
+            "name": cand.get("profile", {}).get("anonymized_name", "Unknown"),
+            "stage": stage, "details": cand,
+        })
 
     end_time = time.time()
     dur_sec = end_time - start_time
-    return BatchRankResponse(
-        ranked_candidates=ranked_candidates,
-        disqualified_candidates=disqualified_logs,
-        total_processed=total_processed,
-        duration_ms=round(dur_sec * 1000, 2),
-        candidates_per_sec=round(total_processed / dur_sec if dur_sec > 0 else 0, 2),
-    )
+    candidates_per_sec = total_processed / dur_sec if dur_sec > 0 else 0
+
+    return {
+        "ranked_candidates": ranked_candidates,
+        "disqualified_candidates": disqualified_logs,
+        "total_processed": total_processed,
+        "duration_ms": dur_sec * 1000.0,
+        "candidates_per_sec": candidates_per_sec,
+    }
 
 
 @app.get("/api/v1/sandbox/market-analysis")
