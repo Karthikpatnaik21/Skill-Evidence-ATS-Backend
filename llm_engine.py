@@ -20,6 +20,8 @@ logger = logging.getLogger("llm-engine")
 # ---------------------------------------------------------------------------
 is_llm_active = False
 _llm = None
+_use_ollama = False
+_ollama_model = "none"
 
 # Track which filename was actually used so callers can log it
 loaded_model_name: str = "none"
@@ -34,10 +36,36 @@ _MODEL_OPTIONS = [
 
 def initialize() -> bool:
     """
-    Download (once) and load the GGUF model.
-    Returns True if the model loaded successfully, False otherwise.
+    Download (once) and load the GGUF model or connect to local Ollama.
+    Returns True if the model loaded successfully/Ollama connected, False otherwise.
     """
     global is_llm_active, _llm, loaded_model_name
+
+    # Try Ollama first — fastest, no GGUF needed
+    try:
+        import urllib.request as _ur
+        logger.info("Checking for local Ollama server on http://127.0.0.1:11434...")
+        with _ur.urlopen("http://127.0.0.1:11434/api/tags", timeout=3) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            models = [m.get("name") for m in data.get("models", [])]
+            chosen = None
+            for candidate in ["qwen2.5-coder:7b", "deepseek-r1:7b"]:
+                if candidate in models:
+                    chosen = candidate
+                    break
+            if not chosen and models:
+                chosen = models[0]
+            if chosen:
+                # Store in globals so ask_llm_json can use the Ollama path
+                global _use_ollama, _ollama_model
+                _use_ollama = True
+                _ollama_model = chosen
+                is_llm_active = True
+                loaded_model_name = f"Ollama ({chosen})"
+                logger.info(f"\u2705 Local Ollama server connected using model: {chosen}")
+                return True
+    except Exception as e:
+        logger.info(f"Ollama not found: {e}. Falling back to llama-cpp GGUF.")
 
     try:
         from llama_cpp import Llama
@@ -126,7 +154,40 @@ def ask_llm_json(system_prompt: str, user_prompt: str, max_tokens: int = 700) ->
     Query the local LLM in JSON mode.
     Returns a parsed dict, or {} on any failure.
     """
-    if not is_llm_active or _llm is None:
+    if not is_llm_active:
+        return {}
+
+    if _use_ollama:
+        try:
+            import urllib.request as _ur
+            payload = json.dumps({
+                "model": _ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.2, "num_predict": max_tokens},
+            }).encode("utf-8")
+            req = _ur.Request(
+                "http://127.0.0.1:11434/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=60) as res:
+                data = json.loads(res.read().decode("utf-8"))
+                raw = data.get("message", {}).get("content", "").strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                    raw = re.sub(r"\n?```$", "", raw)
+                return json.loads(raw)
+        except Exception as e:
+            logger.error(f"Ollama JSON query failed: {e}")
+            return {}
+
+    if _llm is None:
         return {}
     try:
         response = _llm.create_chat_completion(
@@ -150,7 +211,35 @@ def ask_llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 200) ->
     Generate free-form text from the local LLM.
     Returns an empty string on failure.
     """
-    if not is_llm_active or _llm is None:
+    if not is_llm_active:
+        return ""
+
+    if _use_ollama:
+        try:
+            import urllib.request as _ur
+            payload = json.dumps({
+                "model": _ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.4, "num_predict": max_tokens},
+            }).encode("utf-8")
+            req = _ur.Request(
+                "http://127.0.0.1:11434/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=60) as res:
+                data = json.loads(res.read().decode("utf-8"))
+                return data.get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logger.error(f"Ollama text query failed: {e}")
+            return ""
+
+    if _llm is None:
         return ""
     try:
         response = _llm.create_chat_completion(
@@ -260,26 +349,9 @@ def _heuristic_parse_jd(jd_text: str) -> dict:
 def parse_resume(resume_text: str) -> dict:
     """
     Extract structured candidate profile from resume text.
-    Tries local LLM first, falls back to heuristics.
+    Always uses heuristics — LLM is bypassed for resumes so behaviour is
+    identical whether the LLM is connected or not.
     """
-    if is_llm_active:
-        system = (
-            "You are an expert ATS resume parser. Extract a structured JSON profile. "
-            "Output ONLY valid JSON with exactly these keys: "
-            "name (string), skills (array of strings), "
-            "projects (array of objects with keys: title, description, technologies), "
-            "experience (array of objects with keys: role, company, duration, description), "
-            "education (array of objects with keys: degree, school, year), "
-            "certifications (array of strings), achievements (array of strings), "
-            "socialLinks (object with optional keys: github, linkedin, portfolio, website). "
-            "Extract ALL jobs from the resume, even short ones. Do not invent data."
-        )
-        user = f"Resume:\n\n{resume_text[:4500]}"
-        result = ask_llm_json(system, user, max_tokens=900)
-        if result and "name" in result:
-            return result
-
-    # ---- Heuristic fallback ----
     return _heuristic_parse_resume(resume_text)
 
 
