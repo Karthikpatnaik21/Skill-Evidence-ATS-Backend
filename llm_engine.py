@@ -281,15 +281,65 @@ def parse_jd(jd_text: str) -> dict:
     """
     if is_llm_active:
         system = (
-            "You are a senior technical recruiter. Extract a structured JSON job profile "
-            "from the job description below. Output ONLY valid JSON with exactly these keys: "
-            "title (string), requiredSkills (array of strings), preferredSkills (array of strings), "
-            "responsibilities (array of strings, 3-5 items), seniority (string), "
-            "idealProfile (string, 1-2 sentences). Do not add any commentary."
+            "You are an ATS (Applicant Tracking System) parser. "
+            "Extract a structured JSON job profile from the job description. "
+            "Output ONLY valid JSON with exactly these keys:\n"
+            "- title: string, the job title\n"
+            "- requiredSkills: array of SHORT strings. "
+            "  RULES: Each item MUST be a specific technology name, programming language, framework, tool, or methodology. "
+            "  Examples of CORRECT items: [\"Python\", \"PyTorch\", \"RAG\", \"embeddings\", \"BM25\", \"FAISS\", \"LLMs\", \"fine-tuning\", \"vector search\", \"SQL\"]. "
+            "  NEVER write full sentences like 'Experience with embeddings' or 'Deep technical depth'. "
+            "  Extract ONLY the technology/tool/skill noun itself.\n"
+            "- preferredSkills: array of SHORT strings, same rules as requiredSkills but for nice-to-have items\n"
+            "- responsibilities: array of strings (3-5 short sentences describing duties)\n"
+            "- seniority: string (e.g. 'Senior', 'Mid-level', 'Junior')\n"
+            "- idealProfile: string (1-2 sentences describing the ideal candidate)\n"
+            "Do NOT add commentary outside the JSON."
         )
-        user = f"Job Description:\n\n{jd_text[:3500]}"
-        result = ask_llm_json(system, user, max_tokens=650)
+        user = f"Job Description:\n\n{jd_text[:8000]}"
+        result = ask_llm_json(system, user, max_tokens=700)
         if result and "title" in result and "requiredSkills" in result:
+            # Post-process: strip sentences that slipped through despite the prompt
+            def sanitise_skills(skills: list) -> list:
+                sentence_words = re.compile(
+                    r'\b(experience|knowledge|expertise|depth|understanding|ability|'
+                    r'familiarity|proficiency|with|in|of|and|or|the|a|an|to|for|'
+                    r'working|strong|good|solid|excellent|proven|demonstrated)\b',
+                    re.IGNORECASE
+                )
+                strip_prefixes = re.compile(
+                    r'^(?:experience with|knowledge of|strong|expertise in|'
+                    r'proficiency in|familiarity with|understanding of)\s+',
+                    re.IGNORECASE
+                )
+                clean = []
+                for s in (skills or []):
+                    s = s.strip()
+                    # Remove common sentence prefixes
+                    s = strip_prefixes.sub("", s).strip()
+                    # Skip if still looks like a full sentence (too long or contains verb words)
+                    if len(s) > 45:
+                        continue
+                    # Allow through if it looks like a tech term (not sentence-heavy)
+                    word_count = len(s.split())
+                    sentence_word_matches = len(sentence_words.findall(s))
+                    if word_count > 4 and sentence_word_matches > 0:
+                        continue
+                    if s:
+                        clean.append(s)
+                return clean
+
+            result["requiredSkills"] = sanitise_skills(result.get("requiredSkills", []))
+            result["preferredSkills"] = sanitise_skills(result.get("preferredSkills", []))
+            
+            # Guarantee we have something — fall back to heuristic keywords if LLM returned nothing useful
+            if not result["requiredSkills"] or not result["preferredSkills"]:
+                heuristic = _heuristic_parse_jd(jd_text)
+                if not result["requiredSkills"]:
+                    result["requiredSkills"] = heuristic["requiredSkills"]
+                if not result["preferredSkills"]:
+                    result["preferredSkills"] = heuristic["preferredSkills"]
+                    
             return result
 
     # ---- Heuristic fallback ----
